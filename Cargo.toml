@@ -1,0 +1,3 @@
+[workspace]
+members = ["xtask", "switch-rs", "switch-rs-common"]
+resolver = "2"
