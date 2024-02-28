@@ -104,7 +104,10 @@ pub async fn interface_runner(
     mut idx: u32,
 ) -> anyhow::Result<()>{
 
-    let frame_number = 2;
+    const FRAMES: u32 = 64;
+    const FILL_THRESHOLD: u32 = 1 << 5;
+    const COMPLETE_THRESHOLD: u32 = 1 << 5;
+    const FRAME_SIZE: u32 = 1 << 12;
     let mut jh_list = Vec::new();
     
 
@@ -113,12 +116,13 @@ pub async fn interface_runner(
     idx = idx * interface.queues;
 
     for queue_id in 0..interface.queues{
-        let mut stall_count = 0;
-        const WAKE_THRESHOLD: u32 = 1 << 4;
-        let mut stall_threshold = WAKE_THRESHOLD;
+        let mut recv_packet_counter = 0;
+        let mut send_packet_counter = 0;
         let (mut fq_cq, mut ring_rx, mut ring_tx,mut recv_frame_buffer_list,  mut send_frame_buffer_list) ={
             let alloc = Box::new(PacketMap(MaybeUninit::uninit()));
             let mem = NonNull::new(Box::leak(alloc).0.as_mut_ptr()).unwrap();
+            let mut umem_config = UmemConfig::default();
+            umem_config.frame_size = FRAME_SIZE;
             let umem = unsafe { Umem::new(UmemConfig::default(), mem) }.unwrap();
             let info = ifinfo(&interface.name, Some(queue_id)).unwrap();
             let sock = Socket::with_shared(&info, &umem).unwrap();
@@ -141,58 +145,26 @@ pub async fn interface_runner(
             interface_queue_table.insert(interface_queue, idx, 0).unwrap();
             let mut xsk_map = xsk_map.lock().unwrap();
             xsk_map.set(idx, fq_cq.as_raw_fd(), 0).unwrap();
-            /* 
-            let mut frame_list = Vec::new();
-            for i in 0..frame_number{
-                frame_list.push(umem.frame(BufIdx(i)).unwrap());
-            }
-            */
+ 
 
             let mut recv_frame_buffer_list = HashMap::new();
             let mut buf_idx_counter = 0;
-            for i in 0..frame_number{
-                let mut recv_frame = umem.frame(BufIdx(i+1)).unwrap();
+            for i in 0..FRAMES{
+                let mut recv_frame = umem.frame(BufIdx(i)).unwrap();
                 let recv_buf = unsafe { recv_frame.addr.as_mut() };
-                info!("recv frame addr: {:?}", recv_frame.addr);
-                info!("frane number: {}", i);
-                info!("recv buf len: {}", recv_buf.len());
-                info!("recv frame offset: {}", recv_frame.offset);
                 recv_frame_buffer_list.insert(recv_frame.offset, recv_buf);
-                
                 buf_idx_counter += 1;
-                /*
-                let recv_desc = XdpDesc{
-                    addr: recv_frame.offset,
-                    len: 0,
-                    options: 0,
-                };
-                recv_frame_buffer_list.push((recv_buf, recv_desc));
-                buf_idx_counter += 1;
-                */
-            }
-            //info!("recv buf list: {:?}", recv_frame_buffer_list);
-
-            /* 
-            let mut frame = umem.frame(BufIdx(0)).unwrap();
-            info!("available frames: {}", umem.len_frames());
-            */
-            for (k,_) in &recv_frame_buffer_list{
-                info!("recv frame buffer list: {}", k);
             }
 
             {
-                let mut writer = fq_cq.fill(frame_number);
+                let mut writer = fq_cq.fill(FRAMES);
                 writer.insert(recv_frame_buffer_list.iter().map(|(addr, _d)| addr.clone()));
-                //writer.insert_once(frame.offset);
                 writer.commit();
             }
 
-            //let recv_buf = unsafe { frame.addr.as_mut() };
-
             let mut send_frame_buffer_list = Vec::new();
-            for i in 0..frame_number{
+            for i in 0..FRAMES{
                 idx = i + buf_idx_counter;
-                info!("send buf idx: {}", idx);
                 let mut send_frame = umem.frame(BufIdx(idx)).unwrap();
                 let send_buf = unsafe { send_frame.addr.as_mut() };
                 let send_desc = XdpDesc{
@@ -207,19 +179,15 @@ pub async fn interface_runner(
         };
 
         let rx = rx.remove(&queue_id).unwrap();
-        let mut complete_interval = tokio::time::interval(Duration::from_millis(1));
         let mut rcv_interval = tokio::time::interval(Duration::from_nanos(10));
         let recv_tx = recv_tx.clone();
-        let batch: u32 = 1 << 10;
-        let mut sent = 0;
-        let mut completed = 0;
         let jh = tokio::spawn(async move {
             let mut rx = rx.write().await;
-            let mut buffer = Vec::with_capacity(frame_number as usize);
+            let mut buffer = Vec::with_capacity(FRAMES as usize);
             loop{
                 let sent_now: u32; 
                 tokio::select! {
-                    n = rx.recv_many(&mut buffer, frame_number as usize) => {
+                    n = rx.recv_many(&mut buffer, FRAMES as usize) => {
                         let mut desc_list = Vec::with_capacity(n as usize);
                         for i in 0..n as usize{
                             let msg = &buffer[i];
@@ -236,76 +204,50 @@ pub async fn interface_runner(
                             sent_now = writer.insert(desc_list.iter().map(|desc| desc.clone()));
                             info!("SEND sent {} packets", sent_now);
                             writer.commit();
+                            send_packet_counter += sent_now;
                         } 
                         buffer.clear();
                         if ring_tx.needs_wakeup(){
-                            info!("SEND waking up ring_tx");
                             ring_tx.wake();
                         }
-                        let comp_now: u32;   
-                        {
-                            let mut reader = fq_cq.complete(frame_number);
-                            let mut comp_temp = 0;
-                            while reader.read().is_some() {
-                                comp_temp += 1;
+                        {   
+                            if send_packet_counter > COMPLETE_THRESHOLD{
+                                let mut reader = fq_cq.complete(send_packet_counter);
+                                while reader.read().is_some() {
+                                    //comp_temp += 1;
+                                }
+                                //comp_now = comp_temp;
+                                reader.release();
                             }
-                            comp_now = comp_temp;
-                            reader.release();
-                            info!("SEND completed {} packets", comp_now);
                         }
                     },
                     _ = rcv_interval.tick() => {
                         let mut packets = 0;
-                        let mut receiver = ring_rx.receive(frame_number);
+                        let mut receiver = ring_rx.receive(FRAMES);
                         if receiver.capacity() > 0 {
-                            info!("RCV receiver capacity 1: {}",receiver.capacity());
-                            let mut desc_list = Vec::with_capacity(frame_number as usize);
                             while let Some(desc) = receiver.read(){
-                                desc_list.push(desc);
-                                packets += 1;
-                                /* 
-                                info!("RCV received packet on interface {} queue {}", interface.ifidx, queue_id);
-                                let buf = &recv_buf.as_ref()[desc.addr as usize..(desc.addr as usize + desc.len as usize)];
-                                let data = buf.to_vec();
-                                receiver.release();
-                                {
-                                    let mut writer = fq_cq.fill(frame_number);
-                                    writer.insert_once(desc.addr);
-                                    writer.commit();
-                                }
-                                recv_tx.send((interface.ifidx, data)).unwrap();
-                                */
-                            }
-                            receiver.release();
-                            info!("pushed {} descs", desc_list.len());
-                            let mut c = 1;
-                            //info!("recv frame buffer list: {:?}", recv_frame_buffer_list);
-                            for recv_desc in &desc_list{
-                                info!("recv desc_addr: {}", recv_desc.addr);
-                                let buf_idx = (recv_desc.addr / 4096) * 4096;
-                                let offset = recv_desc.addr - buf_idx;
-                                info!("buf_idx: {}", buf_idx);
-                                info!("offset: {}", offset);
-                                
+                                let buf_idx = (desc.addr / FRAME_SIZE as u64) * FRAME_SIZE as u64;
+                                let offset = desc.addr - buf_idx;
                                 if let Some(buf) = recv_frame_buffer_list.get_mut(&buf_idx){
-                                    info!("read data from buffer");
                                     let d = &buf.as_ref()[offset as usize..];
+                                    let b = Arc::new(d);
                                     let data = d.to_vec();
                                     info!("data len: {}", data.len());
                                     recv_tx.send((interface.ifidx, data)).unwrap();
-                                    info!("sent {} packet to recv_tx", c);
-                                    c += 1;
-                                } else {
-                                    info!("buffer not found: {:?}", recv_frame_buffer_list);
+                                    recv_packet_counter += 1;   
+                                }
+                                packets += 1;
+                            }
+                            receiver.release();
+                            {
+                                if recv_packet_counter > FILL_THRESHOLD{
+                                    info!("filling fq_cq with {} packets", recv_packet_counter);
+                                    let mut writer = fq_cq.fill(recv_packet_counter);
+                                    writer.insert(recv_frame_buffer_list.iter().map(|(k,_v)| k.clone()));
+                                    writer.commit();
+                                    recv_packet_counter = 0;
                                 }
                             }
-                            {
-                                info!("filling fq_cq with {} packets", packets);
-                                let mut writer = fq_cq.fill(packets);
-                                writer.insert(desc_list.iter().map(|desc| desc.addr));
-                                writer.commit();
-                            }
-
                         } else {
                             fq_cq.wake();
                         }
