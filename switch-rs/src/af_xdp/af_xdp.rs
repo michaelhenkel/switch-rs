@@ -1,29 +1,31 @@
 use core::{mem::MaybeUninit, num::NonZeroU32, ptr::NonNull};
-use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
 use anyhow::anyhow;
 use switch_rs_common::InterfaceQueue;
 use tokio::sync::RwLock;
 use xdpilone::xdp::XdpDesc;
 use aya::maps::{HashMap as BpfHashMap, MapData, XskMap};
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
-use log::info;
+use log::{error, info};
 use super::interface::interface::Interface;
 
 #[repr(align(4096))]
 struct PacketMap(MaybeUninit<[u8; 1 << 20]>);
 
+const BLA: u32 = 1 << 20;
+
 #[derive(Clone)]
 pub struct AfXdpClient{
-    tx_map: HashMap<u32, HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    tx_map: HashMap<u32, HashMap<u32, tokio::sync::mpsc::Sender<Arc<RwLock<[u8]>>>>>,
 }
 
 impl AfXdpClient{
-    pub fn new(tx_map: HashMap<u32, HashMap<u32,tokio::sync::mpsc::Sender<Vec<u8>>>>) -> Self{
+    pub fn new(tx_map: HashMap<u32, HashMap<u32,tokio::sync::mpsc::Sender<Arc<RwLock<[u8]>>>>>) -> Self{
         AfXdpClient{
             tx_map,
         }
     }
-    pub async fn send(&mut self, ifidx: u32, queue_id: u32, buf: Vec<u8>) -> anyhow::Result<()>{
+    pub async fn send(&mut self, ifidx: u32, queue_id: u32, buf: Arc<RwLock<[u8]>>) -> anyhow::Result<()>{
         if let Some(tx_map) = self.tx_map.get_mut(&ifidx){
             if let Some(tx) = tx_map.get_mut(&queue_id){
                 tx.send(buf).await.unwrap();
@@ -38,7 +40,7 @@ pub struct AfXdp{
     interface_list: HashMap<u32, Interface>,
     xsk_map: Arc<Mutex<XskMap<MapData>>>,
     interface_queue_table: Arc<Mutex<BpfHashMap<MapData, InterfaceQueue, u32>>>,
-    rx_map: HashMap<u32, HashMap<u32,Arc<RwLock<tokio::sync::mpsc::Receiver<Vec<u8>>>>>>,
+    rx_map: HashMap<u32, HashMap<u32,Arc<RwLock<tokio::sync::mpsc::Receiver<Arc<RwLock<[u8]>>>>>>>,
 }
 
 impl AfXdp{
@@ -69,7 +71,7 @@ impl AfXdp{
     pub fn client(&self) -> AfXdpClient{
         self.client.clone()
     }
-    pub async fn run(&mut self, recv_tx: tokio::sync::mpsc::UnboundedSender<(u32, Vec<u8>)>) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>>{
+    pub async fn run(&mut self, recv_tx: tokio::sync::mpsc::UnboundedSender<(u32, Arc<RwLock<[u8]>>)>) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>>{
         let mut rx_map = self.rx_map.clone();
         let interface_list = self.interface_list.clone();
 
@@ -99,8 +101,8 @@ pub async fn interface_runner(
     interface: Interface,
     xsk_map: Arc<Mutex<XskMap<MapData>>>,
     interface_queue_table: Arc<Mutex<BpfHashMap<MapData, InterfaceQueue, u32>>>,
-    mut rx: HashMap<u32,Arc<RwLock<tokio::sync::mpsc::Receiver<Vec<u8>>>>>,
-    recv_tx: tokio::sync::mpsc::UnboundedSender<(u32,Vec<u8>)>,
+    mut rx: HashMap<u32,Arc<RwLock<tokio::sync::mpsc::Receiver<Arc<RwLock<[u8]>>>>>>,
+    recv_tx: tokio::sync::mpsc::UnboundedSender<(u32,Arc<RwLock<[u8]>>)>,
     mut idx: u32,
 ) -> anyhow::Result<()>{
 
@@ -108,6 +110,8 @@ pub async fn interface_runner(
     const FILL_THRESHOLD: u32 = 1 << 5;
     const COMPLETE_THRESHOLD: u32 = 1 << 5;
     const FRAME_SIZE: u32 = 1 << 12;
+    const HEADROOM: u32 = 1 << 8;
+    const PAYLOAD_SIZE: u32 = FRAME_SIZE - HEADROOM;
     let mut jh_list = Vec::new();
     
 
@@ -118,6 +122,8 @@ pub async fn interface_runner(
     for queue_id in 0..interface.queues{
         let mut recv_packet_counter = 0;
         let mut send_packet_counter = 0;
+        let mut total_recv_packet_counter = 0;
+        let mut total_send_packet_counter = 0;
         let (mut fq_cq, mut ring_rx, mut ring_tx,mut recv_frame_buffer_list,  mut send_frame_buffer_list) ={
             let alloc = Box::new(PacketMap(MaybeUninit::uninit()));
             let mem = NonNull::new(Box::leak(alloc).0.as_mut_ptr()).unwrap();
@@ -149,23 +155,30 @@ pub async fn interface_runner(
 
             let mut recv_frame_buffer_list = HashMap::new();
             let mut buf_idx_counter = 0;
-            for i in 0..FRAMES{
-                let mut recv_frame = umem.frame(BufIdx(i)).unwrap();
+            info!("umem frames: {}", umem.len_frames());
+            for i in 0..1 << 8{
+                let mut recv_frame = match umem.frame(BufIdx(i)){
+                    Some(recv_frame) => recv_frame,
+                    None => {
+                        error!("failed to get frame from umem: {}", i);
+                        break;
+                    }
+                };
                 let recv_buf = unsafe { recv_frame.addr.as_mut() };
                 recv_frame_buffer_list.insert(recv_frame.offset, recv_buf);
                 buf_idx_counter += 1;
             }
 
             {
-                let mut writer = fq_cq.fill(FRAMES);
+                let mut writer = fq_cq.fill(1 << 14);
                 writer.insert(recv_frame_buffer_list.iter().map(|(addr, _d)| addr.clone()));
                 writer.commit();
             }
 
             let mut send_frame_buffer_list = Vec::new();
-            for i in 0..FRAMES{
-                idx = i + buf_idx_counter;
-                let mut send_frame = umem.frame(BufIdx(idx)).unwrap();
+            for i in 0..1 << 8{
+                //idx = i + buf_idx_counter;
+                let mut send_frame = umem.frame(BufIdx(i)).unwrap();
                 let send_buf = unsafe { send_frame.addr.as_mut() };
                 let send_desc = XdpDesc{
                     addr: send_frame.offset,
@@ -191,21 +204,22 @@ pub async fn interface_runner(
                         let mut desc_list = Vec::with_capacity(n as usize);
                         for i in 0..n as usize{
                             let msg = &buffer[i];
-                            
-                            let s = msg.as_slice();
-                            info!("SEND received {} packets with len {} for transmission", n, s.len());
+                            let msg = msg.write().await;
                             let (sb, sd) = &mut send_frame_buffer_list[i];
-                            sb[..s.len()].copy_from_slice(s); 
-                            sd.len = s.len() as u32;
+                            sb[..msg.len()].copy_from_slice(&msg); 
+                            sd.len = msg.len() as u32;
                             desc_list.push(*sd);
                         }
                         {
                             let mut writer = ring_tx.transmit(n as u32);
                             sent_now = writer.insert(desc_list.iter().map(|desc| desc.clone()));
-                            info!("SEND sent {} packets", sent_now);
                             writer.commit();
+                            total_send_packet_counter += sent_now;
+                            //info!("interface {}/{} sent packet 4", interface.ifidx, queue_id);
                             send_packet_counter += sent_now;
-                        } 
+                        }
+                        info!("total sent packet: {}", total_send_packet_counter);
+                        
                         buffer.clear();
                         if ring_tx.needs_wakeup(){
                             ring_tx.wake();
@@ -222,37 +236,32 @@ pub async fn interface_runner(
                         }
                     },
                     _ = rcv_interval.tick() => {
-                        let mut packets = 0;
                         let mut receiver = ring_rx.receive(FRAMES);
                         if receiver.capacity() > 0 {
+                            //info!("interface {}/{} received packet 2", interface.ifidx, queue_id);
                             while let Some(desc) = receiver.read(){
                                 let buf_idx = (desc.addr / FRAME_SIZE as u64) * FRAME_SIZE as u64;
                                 let offset = desc.addr - buf_idx;
                                 if let Some(buf) = recv_frame_buffer_list.get_mut(&buf_idx){
                                     let d = &buf.as_ref()[offset as usize..];
-                                    let b = Arc::new(d);
-                                    let data = d.to_vec();
-                                    info!("data len: {}", data.len());
-                                    recv_tx.send((interface.ifidx, data)).unwrap();
-                                    recv_packet_counter += 1;   
+                                    let b: [u8;PAYLOAD_SIZE as usize] = d.try_into().unwrap();
+                                    recv_tx.send((interface.ifidx, Arc::new(RwLock::new(b)))).unwrap();
+                                    recv_packet_counter += 1;
+                                    total_recv_packet_counter += 1;
                                 }
-                                packets += 1;
                             }
                             receiver.release();
                             {
                                 if recv_packet_counter > FILL_THRESHOLD{
-                                    info!("filling fq_cq with {} packets", recv_packet_counter);
                                     let mut writer = fq_cq.fill(recv_packet_counter);
                                     writer.insert(recv_frame_buffer_list.iter().map(|(k,_v)| k.clone()));
                                     writer.commit();
                                     recv_packet_counter = 0;
                                 }
                             }
+                            info!("total received packet: {}", total_recv_packet_counter);
                         } else {
                             fq_cq.wake();
-                        }
-                        if packets > 0 {
-                            info!("RCV received {} packets", packets);
                         }
                         //tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     },                    

@@ -18,6 +18,7 @@ mac_address = "1.1.5"
 xdpilone = "1.0.3"
 futures = "0.3.30"
 pnet = "0.34.0"
+hostname = "0.3.1"
 
 [[bin]]
 name = "switch-rs"

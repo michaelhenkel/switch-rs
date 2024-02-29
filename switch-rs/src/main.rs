@@ -21,6 +21,7 @@ use pnet::packet::{
     ethernet::{EtherTypes, MutableEthernetPacket},
     arp::{ArpPacket, ArpOperations, /*MutableArpPacket*/},
 };
+use tokio::sync::RwLock;
 use crate::af_xdp::interface::interface::Interface;
 pub mod af_xdp;
 
@@ -34,8 +35,6 @@ struct Opt {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let opt = Opt::parse();
-    //timestamp: Option<fmt::TimestampPrecision>
-
     let ts = Some(fmt::TimestampPrecision::Micros);
     env_logger::builder()
     .format_timestamp(ts)
@@ -192,17 +191,20 @@ async fn receive_packet(mut receiver: Box<dyn pnet::datalink::DataLinkReceiver>,
 }
 
 async fn handler(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<(u32, Vec<u8>)>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(u32, Arc<RwLock<[u8]>>)>,
     mut client: AfXdpClient,
     interface_list: HashMap<u32, Interface>,
     mac_table: BpfHashMap<MapData, [u8;6], u32>,
 ) -> anyhow::Result<()>{
+    const FRAME_SIZE: u32 = 1 << 12;
+    const HEADROOM: u32 = 1 << 8;
+    const PAYLOAD_SIZE: u32 = FRAME_SIZE - HEADROOM;
 
-    while let Some((ingress_ifidx, mut packet)) = rx.recv().await {
-        let mut eth_packet = MutableEthernetPacket::new(packet.as_mut_slice()).ok_or(anyhow::anyhow!("failed to parse Ethernet packet"))?;
+    while let Some((ingress_ifidx, packet)) = rx.recv().await {
+        let mut s = packet.write().await;
+        let mut eth_packet = MutableEthernetPacket::new(&mut s).ok_or(anyhow::anyhow!("failed to parse Ethernet packet"))?;
         match eth_packet.get_ethertype(){
             EtherTypes::Arp => {
-                info!("received ARP packet on interface {}", ingress_ifidx);
                 let arp_packet = ArpPacket::new(eth_packet.payload()).ok_or(anyhow::anyhow!("failed to parse ARP packet"))?;
                 let op = arp_packet.get_operation();
                 match op{
@@ -212,10 +214,12 @@ async fn handler(
                                 continue;
                             }
                             eth_packet.set_source(interface.mac.into());
-                            client.send(*ifidx, 0,eth_packet.packet().to_vec()).await?;
+                            let p = eth_packet.packet();
+                            let b: [u8;PAYLOAD_SIZE as usize] = p.try_into().unwrap();
+                            client.send(*ifidx, 0,Arc::new(RwLock::new(b))).await?;
+                            //info!("interface {} transmitted packet 3", ingress_ifidx);
                         }
                     },
-                    //ArpOperations::Reply => {},
                     _ => {}
                 }
             }
@@ -223,9 +227,12 @@ async fn handler(
                 let dmac = eth_packet.get_destination();
                 match mac_table.get(&dmac.into(), 0){
                     Ok(ifidx) => {
-                        if let Err(e) = client.send(ifidx, 0,eth_packet.packet().to_vec()).await{
+                        let p = eth_packet.packet();
+                        let b: [u8;PAYLOAD_SIZE as usize] = p.try_into().unwrap();
+                        if let Err(e) = client.send(ifidx, 0,Arc::new(RwLock::new(b))).await{
                             error!("failed to send packet to interface {}: {}", ifidx, e);
                         }
+                        //info!("interface {} transmitted packet 3", ifidx);
                     },
                     Err(e) => {
                         error!("failed to get interface from MACTABLE: {}", e);

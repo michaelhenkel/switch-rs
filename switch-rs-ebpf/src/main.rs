@@ -43,9 +43,11 @@ pub fn switch_rs(ctx: XdpContext) -> u32 {
 
 fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
     let ingress_if_idx = unsafe { (*ctx.ctx).ingress_ifindex };
+    let queue = unsafe { (*ctx.ctx).rx_queue_index };
     //info!(&ctx,"ingress_if_idx: {}", ingress_if_idx);
     let length = ctx.data_end() - ctx.data();
     let eth_hdr = ptr_at_mut::<EthHdr>(&ctx, 0).ok_or(xdp_action::XDP_ABORTED)?;
+    info!(&ctx, "interface {}/{} received packet 1", ingress_if_idx, queue);
     if unsafe { (*eth_hdr).ether_type } == EtherType::Arp {
         let arp_hdr = match ptr_at::<ArpHdr>(&ctx, EthHdr::LEN){
             Some(arp_hdr) => arp_hdr,
@@ -61,11 +63,11 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
         })? };
 
         let arp_oper = u16::from_be(unsafe { (*arp_hdr).oper });
-    
+        
         match arp_oper {
             1 => {
                 
-                let queue = unsafe { (*ctx.ctx).rx_queue_index };
+                
                 let queue_idx = match unsafe { INTERFACEQUEUETABLE.get(&InterfaceQueue::new(ingress_if_idx, queue))}{
                     Some(queue_idx) => queue_idx,
                     None => {
