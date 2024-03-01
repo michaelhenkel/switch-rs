@@ -126,14 +126,16 @@ async fn main() -> Result<(), anyhow::Error> {
     
     let mut afxdp = AfXdp::new(interface_list.clone(), xsk_map, interface_queue_table);
     let afxdp_client = afxdp.client();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let mut jh_list = Vec::new();
+    /*
     let jh = tokio::spawn(async move {
         handler(rx, afxdp_client, interface_list, mac_table).await.unwrap();
     });
     jh_list.push(jh);
+    */
     let jh = tokio::spawn(async move {
-        afxdp.run(tx).await.unwrap();
+        afxdp.run(tx, mac_table).await.unwrap();
     });
     jh_list.push(jh);
     
@@ -191,7 +193,7 @@ async fn receive_packet(mut receiver: Box<dyn pnet::datalink::DataLinkReceiver>,
 }
 
 async fn handler(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<(u32, Arc<RwLock<[u8]>>)>,
+    mut rx: tokio::sync::mpsc::Receiver<(u32, Arc<RwLock<[u8]>>)>,
     mut client: AfXdpClient,
     interface_list: HashMap<u32, Interface>,
     mac_table: BpfHashMap<MapData, [u8;6], u32>,
