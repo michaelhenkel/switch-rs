@@ -47,7 +47,7 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
     //info!(&ctx,"ingress_if_idx: {}", ingress_if_idx);
     let length = ctx.data_end() - ctx.data();
     let eth_hdr = ptr_at_mut::<EthHdr>(&ctx, 0).ok_or(xdp_action::XDP_ABORTED)?;
-    info!(&ctx, "interface {}/{} received packet", ingress_if_idx, queue);
+    //info!(&ctx, "interface {}/{} received packet", ingress_if_idx, queue);
     if unsafe { (*eth_hdr).ether_type } == EtherType::Arp {
         let arp_hdr = match ptr_at::<ArpHdr>(&ctx, EthHdr::LEN){
             Some(arp_hdr) => arp_hdr,

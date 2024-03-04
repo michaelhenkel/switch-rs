@@ -126,7 +126,7 @@ async fn main() -> Result<(), anyhow::Error> {
     
     let mut afxdp = AfXdp::new(interface_list.clone(), xsk_map, interface_queue_table);
     let afxdp_client = afxdp.client();
-    let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    //let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let mut jh_list = Vec::new();
     /*
     let jh = tokio::spawn(async move {
@@ -135,7 +135,7 @@ async fn main() -> Result<(), anyhow::Error> {
     jh_list.push(jh);
     */
     let jh = tokio::spawn(async move {
-        afxdp.run(tx, mac_table).await.unwrap();
+        afxdp.run2(mac_table).await.unwrap();
     });
     jh_list.push(jh);
     
