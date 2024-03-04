@@ -4,7 +4,7 @@
 use core::mem;
 use aya_bpf::{
     bindings::xdp_action,
-    helpers::{bpf_redirect, bpf_redirect_map},
+    helpers::bpf_redirect,
     macros::{map, xdp},
     maps::{HashMap, XskMap},
     programs::XdpContext,
