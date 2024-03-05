@@ -133,6 +133,7 @@ impl QueueManager{
         let mut queue_list = Vec::new();
         let mut queue_client_map = HashMap::new();
         let mut address_queue_map = HashMap::new();
+        let mut ring_tx_map = HashMap::new();
         //let ring_rx_map = HashMap::new();
         let mut jh_list = Vec::new();
         {
@@ -211,14 +212,15 @@ impl QueueManager{
                         thresholds,
                         total_queues,
                     );
+                    ring_tx_map.insert((interface.ifidx, queue_id), Arc::new(Mutex::new(ring_tx)));
                     queue_client_map.insert((interface.ifidx, queue_id), queue.client());
-                    queue_list.push((queue, ring_rx, ring_tx, frame_buffer, fq_cq));
+                    queue_list.push((queue, ring_rx, frame_buffer, fq_cq));
                 }
             }
 
         }
 
-        for (queue, ring_rx, ring_tx, frame_buffer, fq_cq) in queue_list{
+        for (queue, ring_rx, frame_buffer, fq_cq) in queue_list{
             info!("starting queue: {},{}", queue.ifidx, queue.queue_id);
             info!("frame buffer len: {}", frame_buffer.len());
             info!("start: {} end: {}", queue.buf_start, queue.buf_end);
@@ -228,8 +230,9 @@ impl QueueManager{
             }
             let queue_client_map = queue_client_map.clone();
             let address_queue_map = address_queue_map.clone();
+            let ring_tx_map = ring_tx_map.clone();
             let jh = tokio::spawn(async move{
-                queue.run(frame_buffer, ring_rx, ring_tx, queue_client_map, address_queue_map, fq_cq).await.unwrap();
+                queue.run(frame_buffer, ring_rx, ring_tx_map, queue_client_map, address_queue_map, fq_cq).await.unwrap();
             });
             jh_list.push(jh);
         }
@@ -252,6 +255,7 @@ struct Queue{
     ifidx: u32,
     client: QueueClient,
     sender_rx: Arc<RwLock<tokio::sync::mpsc::Receiver<QueueCommand>>>,
+    sender2_rx: Arc<RwLock<tokio::sync::mpsc::Receiver<XdpDesc>>>,
     interface_list: HashMap<u32, Interface>,
     mac_table: Arc<RwLock<BpfHashMap<MapData, [u8;6], u32>>>,
 }
@@ -267,7 +271,8 @@ impl Queue{
         thresholds: u32,
         totol_queues: u32,
     ) -> Self{
-        let (sender_tx, sender_rx) = tokio::sync::mpsc::channel(100000);
+        let (sender_tx, sender_rx) = tokio::sync::mpsc::channel(100);
+        let (sender2_tx, sender2_rx) = tokio::sync::mpsc::channel(100);
         Queue{
             buf_start,
             buf_end,
@@ -278,8 +283,9 @@ impl Queue{
             thresholds,
             queue_id,
             ifidx,
-            client: QueueClient::new(sender_tx),
+            client: QueueClient::new(sender_tx, sender2_tx),
             sender_rx: Arc::new(RwLock::new(sender_rx)),
+            sender2_rx: Arc::new(RwLock::new(sender2_rx)),
             interface_list,
             mac_table,
         }
@@ -292,7 +298,7 @@ impl Queue{
         &self,
         mut frame_buffer: HashMap<u64, &'static mut [u8]>,
         mut ring_rx: RingRx,
-        mut ring_tx: RingTx,
+        ring_tx_map: HashMap<(u32,u32), Arc<Mutex<RingTx>>>,
         queue_client_map: HashMap<(u32, u32), QueueClient>,
         address_queue_map: HashMap<u64, (u32, u32)>,
         mut fq_cq: DeviceQueue,
@@ -303,7 +309,7 @@ impl Queue{
         let ifidx = self.ifidx;
         let queue_id_ifidx = format!{"{}:{}", ifidx, queue_id};
         
-        let (counter_tx, mut counter_rx) = tokio::sync::mpsc::channel(100000);
+        let (counter_tx, mut counter_rx) = tokio::sync::mpsc::channel(100);
 
 
 
@@ -312,11 +318,12 @@ impl Queue{
         //let mut completed_packets = self.completed_packets;
         let thresholds = self.thresholds;
         let queue_client_map_clone = queue_client_map.clone();
+        let queue_id_ifidx_clone = queue_id_ifidx.clone();
         let jh = tokio::spawn(async move{
             while let Some(counter_command) = counter_rx.recv().await{
                 match counter_command{
-                    CounterCommad::Sent => {
-                        sent_packets += 1;
+                    CounterCommad::Sent(count) => {
+                        sent_packets += count;
                     },
                     CounterCommad::Received => {
                         //received_packets += 1;
@@ -329,7 +336,7 @@ impl Queue{
 
                 }
                 if sent_packets >= thresholds{
-                    //info!("{} Sent threshold reached: {}, total sent: {}", queue_id_ifidx_clone, thresholds, sent_packets);
+                    info!("{} Sent threshold reached: {}, total sent: {}", queue_id_ifidx_clone, thresholds, sent_packets);
                     for (_, queue_client) in &queue_client_map_clone{
                         queue_client.complete(sent_packets).await.unwrap();
                     }
@@ -348,27 +355,20 @@ impl Queue{
         let total_queues_clone = self.totol_queues;
         let buf_start = self.buf_start;
         let buf_end = self.buf_end;
+
+        let queue_id_ifidx_clone = queue_id_ifidx.clone();
+        let queue_client_map_clone = queue_client_map.clone();
         let jh = tokio::spawn(async move {
             let mut sender_rx = sender_rx.write().await;
             while let Some(queue_command) = sender_rx.recv().await {
                 match queue_command{
-                    QueueCommand::Send(desc) => {
-                        //info!("{} Sending descriptor with address: {}",queue_id_ifidx_clone, desc.addr);
-                        {
-                            let mut writer = ring_tx.transmit(1);
-                            writer.insert_once(desc);
-                            writer.commit();
-                        }
-                        if ring_tx.needs_wakeup(){
-                            ring_tx.wake();
-                        }
-                        counter_tx_clone.send(CounterCommad::Sent).await.unwrap();
-                    },
                     QueueCommand::Complete(count) => {
-                        //info!("{} Completing request for {} descriptors",queue_id_ifidx_clone, count);
+                        info!("{} Completing request for {} descriptors",queue_id_ifidx_clone, count);
                         let mut desc_map: HashMap<u64, Vec<u64>> = HashMap::new();
                         {
-                            let mut reader = fq_cq.complete(count);
+                            let available = fq_cq.available();
+                            info!("{} available: {}", queue_id_ifidx_clone, available);
+                            let mut reader = fq_cq.complete(available);
                             while let Some(desc) = reader.read(){
                                 let desc = desc - HEADROOM as u64;
                                 //info!("{} Read descriptor with address: {}",queue_id_ifidx_clone, desc);
@@ -415,7 +415,7 @@ impl Queue{
                             writer.insert(desc_list.iter().map(|k| k.clone()));
                             writer.commit();
                         }
-                        fq_cq.wake();
+                        //fq_cq.wake();
                         
                         info!("{} available: {}", queue_id_ifidx_clone, fq_cq.available());
                         info!("{} pending: {}", queue_id_ifidx_clone, fq_cq.pending());
@@ -437,45 +437,37 @@ impl Queue{
         let queue_id = self.queue_id;
         let mac_table = self.mac_table.clone();
         let counter_tx_clone = counter_tx.clone();
+        let ring_tx_map = ring_tx_map.clone();
+        let queue_client_map_clone = queue_client_map.clone();
+
         //let queue_id_ifidx = queue_id_ifidx.clone();
         let jh = tokio::spawn(async move {
             let mut recv_interval = tokio::time::interval(Duration::from_nanos(1));
             let mut local_mac_table: HashMap<[u8;6], u32> = HashMap::new();
             let mac_table = mac_table.read().await;
             let mut receive_counter = 0;
+            let mut send_counter = 0;
+            
+            let mut send_map = HashMap::new();
+            for interface in interface_list.values(){
+                for queue_id in 0..interface.queues{
+                    let desc_list: Vec<XdpDesc>  = Vec::with_capacity(BATCH_SIZE as usize);
+                    send_map.insert((interface.ifidx, queue_id), desc_list);
+                }
+            }
             loop {
+
                 recv_interval.tick().await;
                 let mut receiver = ring_rx.receive(BATCH_SIZE);
+                let mut fill_list = Vec::new();
                 while let Some(desc) = receiver.read() {
                     receive_counter += 1;
-                    if receive_counter >= thresholds{
-                        if let Some(queue_client) = queue_client_map.get(&(ifidx, queue_id)){
-                            if let Some(pending) = queue_client.pending().await{
-                                if pending < thresholds{
-                                    info!("dropping packets, pending: {}", pending);
-                                    let mut frame_start = buf_start/FRAME_SIZE as u64;
-                                    let frame_end = buf_end/FRAME_SIZE as u64;
-                                    frame_start += pending as u64;
-                                    let mut frame_list = Vec::new();
-                                    for i in frame_start..frame_end{
-                                        let addr = i * FRAME_SIZE as u64;
-                                        frame_list.push(addr);
-                                    }
-                                    queue_client.fill(frame_list).await.unwrap();
-                                    //continue;
-                                }
-                            } else {
-                                error!("failed to get pending");
-                            }
-                        } else {
-                            error!("failed to get queue client");
-                        }
-                        //receive_counter = 0;
-                    }
+
                     //info!("{} Received descriptor with address {}", queue_id_ifidx.clone(), desc.addr);
                     counter_tx_clone.send(CounterCommad::Received).await.unwrap();
                     let buf_idx = (desc.addr / FRAME_SIZE as u64) * FRAME_SIZE as u64;
                     let offset = desc.addr - buf_idx;
+                    
                     if let Some(buf) = frame_buffer.get_mut(&buf_idx) {
                         let buf = &buf.as_ref()[offset as usize..];
                         let mut buf: [u8;PAYLOAD_SIZE as usize] = buf.try_into().unwrap();
@@ -493,18 +485,13 @@ impl Queue{
                                                     let mac = interface.mac;
                                                     eth_packet.set_destination(mac.into());
                                                     eth_packet.set_source(interface.mac.into());
-                                                    if let Some(queue_client) = queue_client_map.get(&(interface.ifidx, queue_id)){
-                                                        if let Err(e) = queue_client.send(desc).await{
-                                                            error!("failed to send to queue client: {}", e);
-                                                        }
-                                                    } else {
-                                                        error!("failed to get queue client");
-                                                    }
+                                                    send_map.get_mut(&(interface.ifidx, queue_id)).unwrap().push(desc);
                                                 }  
                                             },
                                             _ => {},
                                         }
                                     } else {
+                                        fill_list.push(desc.addr);
                                         error!("failed to parse arp packet");
                                     }
                                 },
@@ -517,28 +504,71 @@ impl Queue{
                                             local_mac_table.insert(dst_mac, dst_ifidx);
                                             dst_ifidx
                                         } else {
+                                            fill_list.push(desc.addr);
                                             error!("failed to get dst ifidx");
                                             continue;
                                         }
                                     };
-                                    if let Some(queue_client) = queue_client_map.get(&(dst_ifidx, queue_id)){
-                                        if let Err(e) = queue_client.send(desc).await{
-                                            error!("failed to send to queue client: {}", e);
-                                        }
-                                    } else {
-                                        error!("failed to get queue client");
-                                    }
+                                    send_map.get_mut(&(dst_ifidx, queue_id)).unwrap().push(desc);
                                 },
                                 _ => {
+                                    fill_list.push(desc.addr);
                                     error!("failed to parse packet, not arp or ipv4 {:#?}", eth_packet);
                                 }
                             }
                         } else {
+                            fill_list.push(desc.addr);
                             error!("failed to parse ethernet packet");
                         }
                     } else {
+                        fill_list.push(desc.addr);
                         error!("failed to get buffer for address {}", desc.addr);
                     }
+                }
+
+                if fill_list.len() > 0{
+                    let queue_client = queue_client_map.get(&(ifidx, queue_id)).unwrap();
+                    queue_client.fill(fill_list.clone()).await.unwrap();
+                    fill_list.clear();
+                }
+                
+                for ((ifidx, queue_id), desc_list) in &mut send_map{
+                    if let Some(ring_tx) = ring_tx_map.get(&(*ifidx, *queue_id)){
+                        send(desc_list, &ring_tx).unwrap();
+                        send_counter += desc_list.len() as u32;
+                        desc_list.clear();
+                    }
+                }
+                if send_counter >= thresholds{
+                    for (_, queue_client) in &queue_client_map_clone{
+                        queue_client.complete(sent_packets).await.unwrap();
+                    }
+                    counter_tx_clone.send(CounterCommad::Sent(send_counter)).await.unwrap();
+                    send_counter = 0;
+                }
+                if receive_counter >= thresholds{
+                    if let Some(queue_client) = queue_client_map.get(&(ifidx, queue_id)){
+                        if let Some(pending) = queue_client.pending().await{
+                            if pending < thresholds{
+                                info!("dropping packets, pending: {}", pending);
+                                let mut frame_start = buf_start/FRAME_SIZE as u64;
+                                let frame_end = buf_end/FRAME_SIZE as u64;
+                                frame_start += pending as u64;
+                                let mut frame_list = Vec::new();
+                                for i in frame_start..frame_end{
+                                    let addr = i * FRAME_SIZE as u64;
+                                    frame_list.push(addr);
+                                }
+                                queue_client.fill(frame_list).await.unwrap();
+                                //continue;
+                            }
+                        } else {
+                            error!("failed to get pending");
+                        }
+                    } else {
+                        error!("failed to get queue client");
+                    }
+                    receive_counter = 0;
                 }
                 receiver.release();
             }
@@ -550,19 +580,34 @@ impl Queue{
     
 }
 
+fn send(descriptors: &mut Vec<XdpDesc>, ring_tx: &Arc<Mutex<RingTx>>) -> anyhow::Result<()>{
+    let mut ring_tx = ring_tx.lock().unwrap();
+    {
+        let mut writer = ring_tx.transmit(descriptors.len() as u32);
+        writer.insert(descriptors.iter().map(|k| k.clone()));
+        writer.commit();
+    }
+    if ring_tx.needs_wakeup(){
+        ring_tx.wake();
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct QueueClient{
     sender_tx: tokio::sync::mpsc::Sender<QueueCommand>,
+    sender2_tx: tokio::sync::mpsc::Sender<XdpDesc>,
 }
 
 impl QueueClient{
-    fn new(sender_tx: tokio::sync::mpsc::Sender<QueueCommand>) -> Self{
+    fn new(sender_tx: tokio::sync::mpsc::Sender<QueueCommand>, sender2_tx: tokio::sync::mpsc::Sender<XdpDesc>) -> Self{
         QueueClient{
-            sender_tx
+            sender_tx,
+            sender2_tx,
         }
     }
     async fn send(&self, descriptor: XdpDesc) -> anyhow::Result<()>{
-        self.sender_tx.send(QueueCommand::Send(descriptor)).await.unwrap();
+        self.sender2_tx.send(descriptor).await.unwrap();
         Ok(())
     }
     async fn complete(&self, count: u32) -> anyhow::Result<()>{
@@ -581,7 +626,6 @@ impl QueueClient{
 }
 
 enum QueueCommand{
-    Send(XdpDesc),
     Complete(u32),
     Fill(Vec<u64>),
     Pending{
@@ -590,7 +634,7 @@ enum QueueCommand{
 }
 
 enum CounterCommad{
-    Sent,
+    Sent(u32),
     Received,
 
     //Completed,
