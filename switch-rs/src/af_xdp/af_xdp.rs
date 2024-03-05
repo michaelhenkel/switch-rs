@@ -18,7 +18,8 @@ const FRAME_SIZE: u32 = 1 << 12;
 //const TOTAL_NUMBER_OF_FRAMES: u32 = BUFFER_SIZE/FRAME_SIZE;
 const HEADROOM: u32 = 1 << 8;
 const PAYLOAD_SIZE: u32 = FRAME_SIZE - HEADROOM;
-const BUFFER_SIZE: u32 = 1 << 23;
+const BUFFER_SIZE: u32 = 1 << 25;
+const THRESOLD_FACTOR: u32 = 2;
 #[repr(align(4096))]
 struct PacketMap(MaybeUninit<[u8; BUFFER_SIZE as usize]>);
 
@@ -132,6 +133,7 @@ impl QueueManager{
         let mut queue_list = Vec::new();
         let mut queue_client_map = HashMap::new();
         let mut address_queue_map = HashMap::new();
+        //let ring_rx_map = HashMap::new();
         let mut jh_list = Vec::new();
         {
             let alloc = Box::new(PacketMap(MaybeUninit::uninit()));
@@ -167,9 +169,10 @@ impl QueueManager{
                     let mut frame_buffer = HashMap::new();
                     
                     info!("umem frames: {}", umem.len_frames());
+                    info!("frame size: {}", FRAME_SIZE);
                     let frames_per_queue = umem.len_frames()/total_queues;
                     info!("frames per queue: {}", frames_per_queue);
-                    let thresholds = frames_per_queue/8;
+                    let thresholds = frames_per_queue/THRESOLD_FACTOR;
                     info!("thresholds: {}", thresholds);
                     let queue_frame_start = frames_per_queue * idx;
                     let queue_frame_end = queue_frame_start + frames_per_queue;
@@ -343,6 +346,8 @@ impl Queue{
         let queue_client_map_clone = queue_client_map.clone();
         let counter_tx_clone = counter_tx.clone();
         let total_queues_clone = self.totol_queues;
+        let buf_start = self.buf_start;
+        let buf_end = self.buf_end;
         let jh = tokio::spawn(async move {
             let mut sender_rx = sender_rx.write().await;
             while let Some(queue_command) = sender_rx.recv().await {
@@ -416,6 +421,12 @@ impl Queue{
                         info!("{} pending: {}", queue_id_ifidx_clone, fq_cq.pending());
                         
                     },
+                    QueueCommand::Pending { tx } => {
+                        let pending = fq_cq.pending();
+                        if let Err(e) = tx.send(pending).await{
+                            error!("failed to send pending: {}", e);
+                        }
+                    }
                 }
             }
         });
@@ -431,10 +442,36 @@ impl Queue{
             let mut recv_interval = tokio::time::interval(Duration::from_nanos(1));
             let mut local_mac_table: HashMap<[u8;6], u32> = HashMap::new();
             let mac_table = mac_table.read().await;
+            let mut receive_counter = 0;
             loop {
                 recv_interval.tick().await;
                 let mut receiver = ring_rx.receive(BATCH_SIZE);
                 while let Some(desc) = receiver.read() {
+                    receive_counter += 1;
+                    if receive_counter >= thresholds{
+                        if let Some(queue_client) = queue_client_map.get(&(ifidx, queue_id)){
+                            if let Some(pending) = queue_client.pending().await{
+                                if pending < thresholds{
+                                    info!("dropping packets, pending: {}", pending);
+                                    let mut frame_start = buf_start/FRAME_SIZE as u64;
+                                    let frame_end = buf_end/FRAME_SIZE as u64;
+                                    frame_start += pending as u64;
+                                    let mut frame_list = Vec::new();
+                                    for i in frame_start..frame_end{
+                                        let addr = i * FRAME_SIZE as u64;
+                                        frame_list.push(addr);
+                                    }
+                                    queue_client.fill(frame_list).await.unwrap();
+                                    //continue;
+                                }
+                            } else {
+                                error!("failed to get pending");
+                            }
+                        } else {
+                            error!("failed to get queue client");
+                        }
+                        //receive_counter = 0;
+                    }
                     //info!("{} Received descriptor with address {}", queue_id_ifidx.clone(), desc.addr);
                     counter_tx_clone.send(CounterCommad::Received).await.unwrap();
                     let buf_idx = (desc.addr / FRAME_SIZE as u64) * FRAME_SIZE as u64;
@@ -536,17 +573,26 @@ impl QueueClient{
         self.sender_tx.send(QueueCommand::Fill(desc_list)).await.unwrap();
         Ok(())
     }
+    async fn pending(&self) -> Option<u32>{
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        self.sender_tx.send(QueueCommand::Pending{tx}).await.unwrap();
+        rx.recv().await
+    }
 }
 
 enum QueueCommand{
     Send(XdpDesc),
     Complete(u32),
     Fill(Vec<u64>),
+    Pending{
+        tx: tokio::sync::mpsc::Sender<u32>
+    }
 }
 
 enum CounterCommad{
     Sent,
     Received,
+
     //Completed,
 }
 
