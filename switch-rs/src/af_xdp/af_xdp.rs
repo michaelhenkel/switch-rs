@@ -14,15 +14,16 @@ use super::interface::interface::Interface;
 
 
 //const BUFFER_SIZE: u32 = 1 << 15;
-const BATCH_SIZE: u32 = 512;
+const BATCH_SIZE: u32 = 256;
 const FRAME_SIZE: u32 = 1 << 12;
-//const TOTAL_NUMBER_OF_FRAMES: u32 = BUFFER_SIZE/FRAME_SIZE;
 const HEADROOM: u32 = 1 << 8;
 const PAYLOAD_SIZE: u32 = FRAME_SIZE - HEADROOM;
 const BUFFER_SIZE: u32 = 1 << 24;
 const THRESOLD_FACTOR: u32 = 4;
 const RX_SIZE: u32 = 1 << 11;
 const TX_SIZE: u32 = 1 << 14;
+const RX_INTERVAL: u64 = 256;
+const COMPLETE_INTERVAL: u64 = 32;
 #[repr(align(4096))]
 struct PacketMap(MaybeUninit<[u8; BUFFER_SIZE as usize]>);
 
@@ -200,7 +201,7 @@ impl QueueManager{
                         address_queue_map.insert(queue_index, (interface.ifidx, queue_id));
                     }
                     {
-                        let mut writer = fq_cq.fill(1 << 14);
+                        let mut writer = fq_cq.fill(RX_SIZE);
                         writer.insert(frame_buffer.iter().map(|(addr, _d)| addr.clone()));
                         writer.commit();
                     }
@@ -322,10 +323,33 @@ impl Queue{
         let fq_cq_map_clone = fq_cq_map.clone();
         let mac_table = self.mac_table.clone();
         let address_queue_map_clone = address_queue_map.clone();
-        
+
+        let interface_list_clone = self.interface_list.clone();
         let jh = tokio::spawn(async move{
-            let mut interval_1 = tokio::time::interval(Duration::from_nanos(2));
-            let mut interval_2 = tokio::time::interval(Duration::from_nanos(10));
+            let mut collect_interval = tokio::time::interval(Duration::from_micros(COMPLETE_INTERVAL));
+            loop{
+                collect_interval.tick().await;
+                for (_, interface) in &interface_list_clone{
+                    for queue_id in 0..interface.queues{
+                        let queue_id_ifidx = format!{"{}:{}", interface.ifidx, queue_id};
+                        let complete_map = getter(&fq_cq_map_clone, (interface.ifidx, queue_id)).
+                            map(|fq_cq| complete(fq_cq, total_queues_clone, queue_id_ifidx.clone())).
+                            unwrap().
+                            unwrap();
+                        for (queue_idx, addr_list) in complete_map{
+                            if let Some((ifidx, queue_id)) = address_queue_map_clone.get(&queue_idx){
+                                getter(&fq_cq_map_clone, (*ifidx, *queue_id)).map(|fq_cq| fill(fq_cq, addr_list, queue_id_ifidx.clone())).unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        jh_list.push(jh);
+
+        let fq_cq_map_clone = fq_cq_map.clone();
+        let jh = tokio::spawn(async move{
+            let mut receive_interval = tokio::time::interval(Duration::from_micros(RX_INTERVAL));
             let mut local_mac_table: HashMap<[u8;6], u32> = HashMap::new();
             let mac_table = mac_table.read().await;
             let mut receive_counter = 0;
@@ -340,144 +364,117 @@ impl Queue{
                 }
             }
             loop{
-                tokio::select!{
-                    _ = interval_1.tick() => {
-                        for (_, interface) in &interface_list{
-                            for queue_id in 0..interface.queues{
-                                let queue_id_ifidx = format!{"{}:{}", interface.ifidx, queue_id};
-                                let complete_map = getter(&fq_cq_map_clone, (interface.ifidx, queue_id)).
-                                    map(|fq_cq| complete(fq_cq, total_queues_clone, queue_id_ifidx.clone())).
-                                    unwrap().
-                                    unwrap();
-                                for (queue_idx, addr_list) in complete_map{
-                                    if let Some((ifidx, queue_id)) = address_queue_map_clone.get(&queue_idx){
-                                        getter(&fq_cq_map_clone, (*ifidx, *queue_id)).map(|fq_cq| fill(fq_cq, addr_list, queue_id_ifidx.clone())).unwrap();
-                                    }
-                                }
-                            }
-                        }
-                        
-                    },
-                    _ = interval_2.tick() => {
-                        if send_counter >= thresholds || receive_counter >= thresholds{
-                            let pending_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| pending(fq_cq)).unwrap().unwrap();
-                            let available_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| available(fq_cq)).unwrap().unwrap();
-                            if pending_cnt <= thresholds{
-                                drop_counter += pending_cnt;
-                                info!("1 {} dropped {}, pending {}, available {}, threshold {}",queue_id_ifidx.clone(), drop_counter, pending_cnt, available_cnt, thresholds);
-                                let mut frame_start = buf_start/FRAME_SIZE as u64;
-                                let frame_end = buf_end/FRAME_SIZE as u64;
-                                frame_start += pending_cnt as u64;
-                                let mut frame_list = Vec::new();
-                                for i in frame_start..frame_end{
-                                    let addr = i * FRAME_SIZE as u64;
-                                    frame_list.push(addr);
-                                }
-                                getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| fill(fq_cq, frame_list, queue_id_ifidx.clone())).unwrap();
-                                //continue;
-                                let pending_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| pending(fq_cq)).unwrap().unwrap();
-                                let available_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| available(fq_cq)).unwrap().unwrap();
-                                info!("2 {} dropped {}, pending {}, available {}",queue_id_ifidx.clone(), drop_counter, pending_cnt, available_cnt);
-                            }
-                            receive_counter = 0;
-                        }
-                        let mut receiver = ring_rx.receive(BATCH_SIZE);
-                        let mut fill_list = Vec::new();
-                        //let mut batch_counter = 0;
-                        
-                        while let Some(desc) = receiver.read() {
-                            receive_counter += 1;
-                            //batch_counter += 1;
-        
-                            //info!("{} Received descriptor with address {}", queue_id_ifidx.clone(), desc.addr);
-                            let buf_idx = (desc.addr / FRAME_SIZE as u64) * FRAME_SIZE as u64;
-                            let offset = desc.addr - buf_idx;
-                            
-                            if let Some(buf) = frame_buffer.get_mut(&buf_idx) {
-                                let buf = &buf.as_ref()[offset as usize..];
-                                let mut buf: [u8;PAYLOAD_SIZE as usize] = buf.try_into().unwrap();
-                                if let Some(mut eth_packet) = MutableEthernetPacket::new(&mut buf){
-                                    match eth_packet.get_ethertype(){
-                                        EtherTypes::Arp => {
-                                            if let Some(arp_packet) = ArpPacket::new(eth_packet.payload()){
-                                                let op = arp_packet.get_operation();
-                                                match op{
-                                                    ArpOperations::Request => {
-                                                        for (_, interface) in &interface_list{
-                                                            if interface.ifidx == ifidx{
-                                                                continue;
-                                                            }
-                                                            let mac = interface.mac;
-                                                            eth_packet.set_destination(mac.into());
-                                                            eth_packet.set_source(interface.mac.into());
-                                                            send_map.get_mut(&(interface.ifidx, queue_id)).unwrap().push(desc);
-                                                        }  
-                                                    },
-                                                    _ => {},
-                                                }
-                                            } else {
-                                                fill_list.push(desc.addr);
-                                                error!("failed to parse arp packet");
-                                            }
-                                        },
-                                        EtherTypes::Ipv4 => {
-                                            let dst_mac: [u8;6] = eth_packet.get_destination().into();
-                                            let dst_ifidx = if let Some(dst_ifidx) = local_mac_table.get(&dst_mac){
-                                                *dst_ifidx
-                                            } else {
-                                                if let Ok(dst_ifidx) = mac_table.get(&dst_mac.into(),0){
-                                                    local_mac_table.insert(dst_mac, dst_ifidx);
-                                                    dst_ifidx
-                                                } else {
-                                                    fill_list.push(desc.addr);
-                                                    error!("failed to get dst ifidx");
-                                                    continue;
-                                                }
-                                            };
-                                            send_map.get_mut(&(dst_ifidx, queue_id)).unwrap().push(desc);
-                                        },
-                                        _ => {
-                                            fill_list.push(desc.addr);
-                                            error!("failed to parse packet, not arp or ipv4 {:#?}", eth_packet);
-                                        }
-                                    }
-                                } else {
-                                    fill_list.push(desc.addr);
-                                    error!("failed to parse ethernet packet");
-                                }
-                            } else {
-                                fill_list.push(desc.addr);
-                                error!("failed to get buffer for address {}", desc.addr);
-                            }
-                        }
-                        /*
-                        if batch_counter > 0{
-                            info!("{} batch received: {}", queue_id_ifidx, batch_counter);
-                        }
-                        */
-        
-                        if fill_list.len() > 0{
-                            getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| fill(fq_cq, fill_list.clone(), queue_id_ifidx.clone())).unwrap();
-                            fill_list.clear();
-                        }
-                        
-                        for ((ifidx, queue_id), desc_list) in &mut send_map{
-                            if desc_list.len() == 0{
-                                continue;
-                            }
-                            //info!("{} sending: {}", queue_id_ifidx, desc_list.len() as u32);
-                            getter(&ring_tx_map, (*ifidx, *queue_id)).map(|ring_tx| send(desc_list, &ring_tx, queue_id_ifidx.clone())).unwrap();
-                            send_counter += desc_list.len() as u32;
-                            desc_list.clear();
-                        }
-        
-        
-                        receiver.release();
-                    },
+                if send_counter >= thresholds || receive_counter >= thresholds{
+                    let pending_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| pending(fq_cq)).unwrap().unwrap();
+                    let available_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| available(fq_cq)).unwrap().unwrap();
+                    if pending_cnt <= thresholds{
+
+                        drop_counter += pending_cnt;
+                        info!("1 {} dropped {}, pending {}, available {}, threshold {}",queue_id_ifidx.clone(), drop_counter, pending_cnt, available_cnt, thresholds);
+                        tokio::time::sleep(Duration::from_micros(COMPLETE_INTERVAL)).await;
+                        let pending_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| pending(fq_cq)).unwrap().unwrap();
+                        let available_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| available(fq_cq)).unwrap().unwrap();
+                        info!("2 {} dropped {}, pending {}, available {}",queue_id_ifidx.clone(), drop_counter, pending_cnt, available_cnt);
+                    }
+                    receive_counter = 0;
                 }
+                let mut receiver = ring_rx.receive(BATCH_SIZE);
+                let mut fill_list = Vec::new();
+                //let mut batch_counter = 0;
+
+                while let Some(desc) = receiver.read() {
+                    receive_counter += 1;
+                    //batch_counter += 1;
+
+                    //info!("{} Received descriptor with address {}", queue_id_ifidx.clone(), desc.addr);
+                    let buf_idx = (desc.addr / FRAME_SIZE as u64) * FRAME_SIZE as u64;
+                    let offset = desc.addr - buf_idx;
+
+                    if let Some(buf) = frame_buffer.get_mut(&buf_idx) {
+                        let buf = &buf.as_ref()[offset as usize..];
+                        let mut buf: [u8;PAYLOAD_SIZE as usize] = buf.try_into().unwrap();
+                        if let Some(mut eth_packet) = MutableEthernetPacket::new(&mut buf){
+                            match eth_packet.get_ethertype(){
+                                EtherTypes::Arp => {
+                                    if let Some(arp_packet) = ArpPacket::new(eth_packet.payload()){
+                                        let op = arp_packet.get_operation();
+                                        match op{
+                                            ArpOperations::Request => {
+                                                for (_, interface) in &interface_list{
+                                                    if interface.ifidx == ifidx{
+                                                        continue;
+                                                    }
+                                                    let mac = interface.mac;
+                                                    eth_packet.set_destination(mac.into());
+                                                    eth_packet.set_source(interface.mac.into());
+                                                    send_map.get_mut(&(interface.ifidx, queue_id)).unwrap().push(desc);
+                                                }  
+                                            },
+                                            _ => {},
+                                        }
+                                    } else {
+                                        fill_list.push(desc.addr);
+                                        error!("failed to parse arp packet");
+                                    }
+                                },
+                                EtherTypes::Ipv4 => {
+                                    let dst_mac: [u8;6] = eth_packet.get_destination().into();
+                                    let dst_ifidx = if let Some(dst_ifidx) = local_mac_table.get(&dst_mac){
+                                        *dst_ifidx
+                                    } else {
+                                        if let Ok(dst_ifidx) = mac_table.get(&dst_mac.into(),0){
+                                            local_mac_table.insert(dst_mac, dst_ifidx);
+                                            dst_ifidx
+                                        } else {
+                                            fill_list.push(desc.addr);
+                                            error!("failed to get dst ifidx");
+                                            continue;
+                                        }
+                                    };
+                                    send_map.get_mut(&(dst_ifidx, queue_id)).unwrap().push(desc);
+                                },
+                                _ => {
+                                    fill_list.push(desc.addr);
+                                    error!("failed to parse packet, not arp or ipv4 {:#?}", eth_packet);
+                                }
+                            }
+                        } else {
+                            fill_list.push(desc.addr);
+                            error!("failed to parse ethernet packet");
+                        }
+                    } else {
+                        fill_list.push(desc.addr);
+                        error!("failed to get buffer for address {}", desc.addr);
+                    }
+                }
+                /*
+                if batch_counter > 0{
+                    info!("{} batch received: {}", queue_id_ifidx, batch_counter);
+                }
+                */
+
+                if fill_list.len() > 0{
+                    getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| fill(fq_cq, fill_list.clone(), queue_id_ifidx.clone())).unwrap();
+                    fill_list.clear();
+                }
+
+                for ((ifidx, queue_id), desc_list) in &mut send_map{
+                    if desc_list.len() == 0{
+                        continue;
+                    }
+                    //info!("{} sending: {}", queue_id_ifidx, desc_list.len() as u32);
+                    getter(&ring_tx_map, (*ifidx, *queue_id)).map(|ring_tx| send(desc_list, &ring_tx, queue_id_ifidx.clone())).unwrap();
+                    send_counter += desc_list.len() as u32;
+                    desc_list.clear();
+                }
+
+
+                receiver.release();
             }
         });
         jh_list.push(jh);
+        
+       
 
 
         /*
