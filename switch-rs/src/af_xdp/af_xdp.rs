@@ -13,16 +13,14 @@ use log::{error, info};
 use super::interface::interface::Interface;
 
 
-//const BUFFER_SIZE: u32 = 1 << 15;
-const BATCH_SIZE: u32 = 256;
+//const BUFFER_SIZE: u32 = 1 << 16;
+const BATCH_SIZE: u32 = 32;
 const FRAME_SIZE: u32 = 1 << 12;
 const HEADROOM: u32 = 1 << 8;
 const PAYLOAD_SIZE: u32 = FRAME_SIZE - HEADROOM;
-const BUFFER_SIZE: u32 = 1 << 24;
+const BUFFER_SIZE: u32 = 1 << 23;
 const THRESOLD_FACTOR: u32 = 4;
-const RX_SIZE: u32 = 1 << 11;
-const TX_SIZE: u32 = 1 << 14;
-const RX_INTERVAL: u64 = 256;
+const RX_INTERVAL: u64 = 500;
 const COMPLETE_INTERVAL: u64 = 32;
 #[repr(align(4096))]
 struct PacketMap(MaybeUninit<[u8; BUFFER_SIZE as usize]>);
@@ -138,8 +136,10 @@ impl QueueManager{
         let mut queue_client_map = HashMap::new();
         let mut address_queue_map = HashMap::new();
         let mut ring_tx_map = HashMap::new();
-        let mut fq_cq_map = HashMap::new();
-        
+        let mut complete_counter_map = HashMap::new();
+        let mut complete_address_list: HashMap<u64, Arc<Mutex<Vec<u64>>>> = HashMap::new();
+        let total_queues: u32 = self.interface_list.iter().map(|(_k,v)| v.queues).sum();
+
         //let ring_rx_map = HashMap::new();
         let mut jh_list = Vec::new();
         {
@@ -148,13 +148,25 @@ impl QueueManager{
             let mut umem_config = UmemConfig::default();
             umem_config.frame_size = FRAME_SIZE;
             let umem = unsafe { Umem::new(UmemConfig::default(), mem) }.unwrap();
+
+            let per_queue_frames = umem.len_frames()/total_queues;
+            let rx_size = per_queue_frames/2;
+            let tx_size = per_queue_frames;
+            let fq_size = per_queue_frames;
+            let threshold = per_queue_frames/THRESOLD_FACTOR;
+            info!("total queues: {}", total_queues);
+            info!("total frames: {}", umem.len_frames());
+            info!("per queue frames: {}", per_queue_frames);
+            info!("rx size: {}", rx_size);
+            info!("tx size: {}", tx_size);
+            info!("fq size: {}", fq_size);
+            info!("threshold: {}", threshold);
             let mut rx_tx_config = SocketConfig {
-                rx_size: NonZeroU32::new(RX_SIZE),
-                tx_size: NonZeroU32::new(TX_SIZE),
+                rx_size: NonZeroU32::new(rx_size),
+                tx_size: NonZeroU32::new(tx_size),
                 bind_flags: SocketConfig::XDP_BIND_ZEROCOPY | SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_SHARED_UMEM,
             };
             let mut idx = 0;
-            let total_queues: u32 = self.interface_list.iter().map(|(_k,v)| v.queues).sum();
             let mut interface_queue_table = self.interface_queue_table.lock().unwrap();
             let mut xsk_map = self.xsk_map.lock().unwrap();
             for (_ifidx, interface) in &self.interface_list{
@@ -174,15 +186,8 @@ impl QueueManager{
                         error!("failed to bind umem: {}", e);
                     }
                     let mut frame_buffer = HashMap::new();
-                    
-                    info!("umem frames: {}", umem.len_frames());
-                    info!("frame size: {}", FRAME_SIZE);
-                    let frames_per_queue = umem.len_frames()/total_queues;
-                    info!("frames per queue: {}", frames_per_queue);
-                    let thresholds = frames_per_queue/THRESOLD_FACTOR;
-                    info!("thresholds: {}", thresholds);
-                    let queue_frame_start = frames_per_queue * idx;
-                    let queue_frame_end = queue_frame_start + frames_per_queue;
+                    let queue_frame_start = per_queue_frames * idx;
+                    let queue_frame_end = queue_frame_start + per_queue_frames;
                     info!("queue frame start: {}", queue_frame_start);
                     info!("queue frame end: {}", queue_frame_end);
                     for i in queue_frame_start..queue_frame_end{
@@ -201,7 +206,8 @@ impl QueueManager{
                         address_queue_map.insert(queue_index, (interface.ifidx, queue_id));
                     }
                     {
-                        let mut writer = fq_cq.fill(RX_SIZE);
+                        info!("filling fq_cq with {} frames, fb length: {}", fq_size, frame_buffer.len());
+                        let mut writer = fq_cq.fill(fq_size);
                         writer.insert(frame_buffer.iter().map(|(addr, _d)| addr.clone()));
                         writer.commit();
                     }
@@ -209,28 +215,34 @@ impl QueueManager{
                     let interface_queue = InterfaceQueue::new(interface.ifidx, queue_id);
                     interface_queue_table.insert(interface_queue, idx, 0).unwrap();
                     xsk_map.set(idx, ring_rx.as_raw_fd(), 0).unwrap();
-                    idx += 1;
+                    info!("queue: {},{} pending {}", interface.ifidx, queue_id, fq_cq.pending());
+                    info!("queue: {},{} available {}", interface.ifidx, queue_id, fq_cq.available());
                     let queue = Queue::new(
+                        idx,
                         (queue_frame_start  * FRAME_SIZE) as u64,
                         (queue_frame_end * FRAME_SIZE) as u64,
                         queue_id,
                         interface.ifidx,
                         self.interface_list.clone(),
                         self.mac_table.clone(),
-                        thresholds,
+                        Arc::new(Mutex::new(fq_cq)),
+                        threshold,
                         total_queues,
                     );
-                    info!("queue: {},{} pending {}", interface.ifidx, queue_id, fq_cq.pending());
+                    
                     ring_tx_map.insert((interface.ifidx, queue_id), Arc::new(Mutex::new(ring_tx)));
-                    fq_cq_map.insert((interface.ifidx, queue_id), Arc::new(Mutex::new(fq_cq)));
                     queue_client_map.insert((interface.ifidx, queue_id), queue.client());
+                    complete_counter_map.insert(idx as u64, 0);
+                    complete_address_list.insert(idx as u64, Arc::new(Mutex::new(Vec::new())));
                     queue_list.push((queue, ring_rx, frame_buffer));
+                    idx += 1;
                 }
             }
 
         }
 
-        for (queue, ring_rx, frame_buffer) in queue_list{
+        let complete_counter_map = Arc::new(Mutex::new(complete_counter_map));
+        for (mut queue, ring_rx, frame_buffer) in queue_list{
             info!("starting queue: {},{}", queue.ifidx, queue.queue_id);
             info!("frame buffer len: {}", frame_buffer.len());
             info!("start: {} end: {}", queue.buf_start, queue.buf_end);
@@ -238,9 +250,10 @@ impl QueueManager{
             let queue_client_map = queue_client_map.clone();
             let address_queue_map = address_queue_map.clone();
             let ring_tx_map = ring_tx_map.clone();
-            let fq_cq_map = fq_cq_map.clone();
+            queue.complete_counter_map = complete_counter_map.clone();
+            queue.complete_address_list = complete_address_list.clone();
             let jh = tokio::spawn(async move{
-                queue.run(frame_buffer, ring_rx, ring_tx_map, queue_client_map, address_queue_map, fq_cq_map).await.unwrap();
+                queue.run(frame_buffer, ring_rx, ring_tx_map, queue_client_map, address_queue_map).await.unwrap();
             });
             jh_list.push(jh);
         }
@@ -252,12 +265,14 @@ impl QueueManager{
 }
 
 struct Queue{
+    id: u32,
     buf_start: u64,
     buf_end: u64,
     totol_queues: u32,
     sent_packets: u32,
     //received_packets: u32,
     //completed_packets: u32,
+    fq_cq: Arc<Mutex<DeviceQueue>>,
     thresholds: u32,
     queue_id: u32,
     ifidx: u32,
@@ -266,34 +281,42 @@ struct Queue{
     sender2_rx: Arc<RwLock<tokio::sync::mpsc::Receiver<XdpDesc>>>,
     interface_list: HashMap<u32, Interface>,
     mac_table: Arc<RwLock<BpfHashMap<MapData, [u8;6], u32>>>,
+    complete_counter_map: Arc<Mutex<HashMap<u64, u64>>>,
+    complete_address_list: HashMap<u64, Arc<Mutex<Vec<u64>>>>,
 }
 
 impl Queue{
     fn new(
+        id: u32,
         buf_start: u64,
         buf_end: u64,
         queue_id: u32,
         ifidx: u32,
         interface_list: HashMap<u32, Interface>,
         mac_table: Arc<RwLock<BpfHashMap<MapData, [u8;6], u32>>>,
+        fq_cq: Arc<Mutex<DeviceQueue>>,
         thresholds: u32,
         totol_queues: u32,
     ) -> Self{
         let (sender_tx, sender_rx) = tokio::sync::mpsc::channel(100);
         let (sender2_tx, sender2_rx) = tokio::sync::mpsc::channel(100);
         Queue{
+            id,
             buf_start,
             buf_end,
             totol_queues,
             sent_packets: 0,
             thresholds,
             queue_id,
+            fq_cq,
             ifidx,
             client: QueueClient::new(sender_tx, sender2_tx),
             sender_rx: Arc::new(RwLock::new(sender_rx)),
             sender2_rx: Arc::new(RwLock::new(sender2_rx)),
             interface_list,
             mac_table,
+            complete_counter_map: Arc::new(Mutex::new(HashMap::new())),
+            complete_address_list: HashMap::new(),
         }
     }
     fn client(&self) -> QueueClient{
@@ -307,7 +330,6 @@ impl Queue{
         ring_tx_map: HashMap<(u32,u32), Arc<Mutex<RingTx>>>,
         queue_client_map: HashMap<(u32, u32), QueueClient>,
         address_queue_map: HashMap<u64, (u32, u32)>,
-        fq_cq_map: HashMap<(u32,u32), Arc<Mutex<DeviceQueue>>>,
     ) -> anyhow::Result<()> {
         let mut jh_list = Vec::new();
 
@@ -318,44 +340,49 @@ impl Queue{
         let total_queues_clone = self.totol_queues;
         let buf_start = self.buf_start;
         let buf_end = self.buf_end;
+        let id = self.id;
+
 
         let interface_list = self.interface_list.clone();
-        let fq_cq_map_clone = fq_cq_map.clone();
+        let fq_cq_clone = self.fq_cq.clone();
         let mac_table = self.mac_table.clone();
         let address_queue_map_clone = address_queue_map.clone();
 
+        let queue_ifidx_clone = queue_id_ifidx.clone();
+        let queue_id_ifidx_clone = queue_id_ifidx.clone();
         let interface_list_clone = self.interface_list.clone();
+        let complete_counter_map = self.complete_counter_map.clone();
+        let complete_address_list_clone = self.complete_address_list.clone();
+        /*
         let jh = tokio::spawn(async move{
             let mut collect_interval = tokio::time::interval(Duration::from_micros(COMPLETE_INTERVAL));
+
+            
             loop{
                 collect_interval.tick().await;
-                for (_, interface) in &interface_list_clone{
-                    for queue_id in 0..interface.queues{
-                        let queue_id_ifidx = format!{"{}:{}", interface.ifidx, queue_id};
-                        let complete_map = getter(&fq_cq_map_clone, (interface.ifidx, queue_id)).
-                            map(|fq_cq| complete(fq_cq, total_queues_clone, queue_id_ifidx.clone())).
-                            unwrap().
-                            unwrap();
-                        for (queue_idx, addr_list) in complete_map{
-                            if let Some((ifidx, queue_id)) = address_queue_map_clone.get(&queue_idx){
-                                getter(&fq_cq_map_clone, (*ifidx, *queue_id)).map(|fq_cq| fill(fq_cq, addr_list, queue_id_ifidx.clone())).unwrap();
-                            }
-                        }
-                    }
+
+                let completed = complete(&fq_cq_clone, total_queues_clone, queue_id_ifidx_clone.clone(), complete_address_list_clone.clone()).unwrap();
+                if completed > 0{
+                    info!("{} completed {}", queue_id_ifidx_clone, completed);
                 }
             }
         });
         jh_list.push(jh);
+        */
 
-        let fq_cq_map_clone = fq_cq_map.clone();
+        let fq_cq_clone = self.fq_cq.clone();
+        let mut complete_address_list_clone = self.complete_address_list.clone();
+
         let jh = tokio::spawn(async move{
-            let mut receive_interval = tokio::time::interval(Duration::from_micros(RX_INTERVAL));
+            let mut receive_interval = tokio::time::interval(Duration::from_micros(1));
             let mut local_mac_table: HashMap<[u8;6], u32> = HashMap::new();
             let mac_table = mac_table.read().await;
             let mut receive_counter = 0;
             let mut send_counter = 0;
             let mut drop_counter = 0;
-            
+            let mut total_receive_counter = 0;
+            let mut fill_deficit = 0;
+            let mut total_fill_counter = 0;
             let mut send_map = HashMap::new();
             for interface in interface_list.values(){
                 for queue_id in 0..interface.queues{
@@ -364,27 +391,31 @@ impl Queue{
                 }
             }
             loop{
-                if send_counter >= thresholds || receive_counter >= thresholds{
+                /*
+                if receive_counter >= thresholds{
+                    info!("{} 1 received: {}, threshold: {}", queue_id_ifidx, receive_counter, thresholds);
                     let pending_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| pending(fq_cq)).unwrap().unwrap();
-                    let available_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| available(fq_cq)).unwrap().unwrap();
-                    if pending_cnt <= thresholds{
-
-                        drop_counter += pending_cnt;
-                        info!("1 {} dropped {}, pending {}, available {}, threshold {}",queue_id_ifidx.clone(), drop_counter, pending_cnt, available_cnt, thresholds);
-                        tokio::time::sleep(Duration::from_micros(COMPLETE_INTERVAL)).await;
-                        let pending_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| pending(fq_cq)).unwrap().unwrap();
-                        let available_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| available(fq_cq)).unwrap().unwrap();
-                        info!("2 {} dropped {}, pending {}, available {}",queue_id_ifidx.clone(), drop_counter, pending_cnt, available_cnt);
+                    let addr_list = complete_address_list_clone.get(&(id as u64)).unwrap();
+                    let addr_list: Vec<u64> = addr_list.lock().unwrap().drain(0..).collect();
+                    info!("{} 1 pending: {}, drained: {:?}", queue_id_ifidx, pending_cnt, addr_list);
+                    if addr_list.len() > 0{
+                        getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| fill(fq_cq, addr_list, queue_id_ifidx.clone())).unwrap();
                     }
+                    let pending_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| pending(fq_cq)).unwrap().unwrap();
+                    info!("{} pending: {}", queue_id_ifidx, pending_cnt);
                     receive_counter = 0;
                 }
+                */
+                receive_interval.tick().await;
                 let mut receiver = ring_rx.receive(BATCH_SIZE);
                 let mut fill_list = Vec::new();
-                //let mut batch_counter = 0;
+                let mut batch_counter = 0;
+                let mut fq_cq = fq_cq_clone.lock().unwrap();
 
                 while let Some(desc) = receiver.read() {
                     receive_counter += 1;
-                    //batch_counter += 1;
+                    batch_counter += 1;
+                    total_receive_counter += 1;
 
                     //info!("{} Received descriptor with address {}", queue_id_ifidx.clone(), desc.addr);
                     let buf_idx = (desc.addr / FRAME_SIZE as u64) * FRAME_SIZE as u64;
@@ -417,6 +448,7 @@ impl Queue{
                                         error!("failed to parse arp packet");
                                     }
                                 },
+                                /*
                                 EtherTypes::Ipv4 => {
                                     let dst_mac: [u8;6] = eth_packet.get_destination().into();
                                     let dst_ifidx = if let Some(dst_ifidx) = local_mac_table.get(&dst_mac){
@@ -433,9 +465,10 @@ impl Queue{
                                     };
                                     send_map.get_mut(&(dst_ifidx, queue_id)).unwrap().push(desc);
                                 },
+                                */
                                 _ => {
                                     fill_list.push(desc.addr);
-                                    error!("failed to parse packet, not arp or ipv4 {:#?}", eth_packet);
+                                    //error!("failed to parse packet, not arp or ipv4 {:#?}", eth_packet);
                                 }
                             }
                         } else {
@@ -447,15 +480,30 @@ impl Queue{
                         error!("failed to get buffer for address {}", desc.addr);
                     }
                 }
-                /*
+
                 if batch_counter > 0{
-                    info!("{} batch received: {}", queue_id_ifidx, batch_counter);
+                    //info!("{} batch received: {}, total {}", queue_id_ifidx, batch_counter, total_receive_counter);
                 }
-                */
+
+                receiver.release();
 
                 if fill_list.len() > 0{
-                    getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| fill(fq_cq, fill_list.clone(), queue_id_ifidx.clone())).unwrap();
+                    //tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
+                    let filled = fill(&mut fq_cq, fill_list.clone(), queue_id_ifidx.clone()).unwrap();
+                    let pending = pending(&fq_cq_clone).unwrap();
+                    total_fill_counter += filled;
+                    //info!("{} fill list: {}, filled: {}, total: {}",queue_id_ifidx, fill_list.len(), filled, total_fill_counter);
+                    if filled != fill_list.len() as u32{
+                        fill_deficit += fill_list.len() as u32 - filled;
+                        error!("{} fill list: {}, filled: {}, deficit: {}, total: {}",queue_id_ifidx, fill_list.len(), filled, fill_deficit, total_fill_counter);
+                    }
                     fill_list.clear();
+                }
+
+                let pending_cnt =  pending(&fq_cq_clone).unwrap();
+                if pending_cnt <= thresholds{
+                    info!("{} 2 pending: {} threshold: {}", queue_id_ifidx, pending_cnt, thresholds);
+                    panic!("pending is 0");
                 }
 
                 for ((ifidx, queue_id), desc_list) in &mut send_map{
@@ -465,11 +513,29 @@ impl Queue{
                     //info!("{} sending: {}", queue_id_ifidx, desc_list.len() as u32);
                     getter(&ring_tx_map, (*ifidx, *queue_id)).map(|ring_tx| send(desc_list, &ring_tx, queue_id_ifidx.clone())).unwrap();
                     send_counter += desc_list.len() as u32;
+                    let addr_list: Vec<u64> = desc_list.iter().map(|k| k.addr - HEADROOM as u64).collect();
+                    info!("{} sent: {} {:?}", queue_id_ifidx, send_counter, addr_list);
                     desc_list.clear();
+                    
                 }
 
-
-                receiver.release();
+                /*
+                let pending_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| pending(fq_cq)).unwrap().unwrap();
+                if pending_cnt <= thresholds{
+                    info!("{} 2 pending: {} threshold: {}", queue_id_ifidx, pending_cnt, thresholds);
+                    let addr_list = complete_address_list_clone.get(&(id as u64)).unwrap();
+                    let addr_list: Vec<u64> = addr_list.lock().unwrap().drain(0..).collect();
+                    info!("{} 2 pending: {}, drained: {:?}", queue_id_ifidx,    pending_cnt, addr_list);
+                    if addr_list.len() > 0{
+                        getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| fill(fq_cq, addr_list, queue_id_ifidx.clone())).unwrap();
+                    }
+                    let pending_cnt = getter(&fq_cq_map_clone, (ifidx, queue_id)).map(|fq_cq| pending(fq_cq)).unwrap().unwrap();
+                    info!("{} pending: {}", queue_id_ifidx, pending_cnt);
+                    if pending_cnt == 0{
+                        panic!("pending is 0");
+                    }
+                }
+                */
             }
         });
         jh_list.push(jh);
@@ -674,46 +740,50 @@ fn send(descriptors: &mut Vec<XdpDesc>, ring_tx: &Arc<Mutex<RingTx>>, queue_id_i
     Ok(())
 }
 
-fn complete(fq_cq: &Arc<Mutex<DeviceQueue>>, total_queues: u32, queue_id_ifidx: String) -> anyhow::Result<HashMap<u64, Vec<u64>>>{
-    let mut desc_map: HashMap<u64, Vec<u64>> = HashMap::new();
+fn complete(fq_cq: &Arc<Mutex<DeviceQueue>>, total_queues: u32, queue_id_ifidx: String, complete_address_list: HashMap<u64, Arc<Mutex<Vec<u64>>>>) -> anyhow::Result<u32>{
     let mut fq_cq = fq_cq.lock().unwrap();
     let mut completed = 0;
+    let mut addr_map: HashMap<u64, Vec<u64>> = HashMap::new();
     let available = fq_cq.available();
     {
 
         let mut reader = fq_cq.complete(available);
-        while let Some(desc) = reader.read(){
-            let desc = desc - HEADROOM as u64;
+        while let Some(addr) = reader.read(){
+            let addr = addr - HEADROOM as u64;
             //info!("{} Read descriptor with address: {}",queue_id_ifidx_clone, desc);
             let interval = BUFFER_SIZE/total_queues;
-            let queue_idx = desc/interval as u64;
+            let queue_idx = addr/interval as u64;
             let queue_idx = queue_idx.min(total_queues as u64-1);
-            if let Some(desc_list) = desc_map.get_mut(&queue_idx){
-                desc_list.push(desc);
+
+            if let Some(addr_list) = addr_map.get_mut(&queue_idx){
+                addr_list.push(addr);
             } else {
-                let mut desc_list = Vec::new();
-                desc_list.push(desc);
-                desc_map.insert(queue_idx, desc_list);
+                addr_map.insert(queue_idx, vec![addr]);
             }
+
+
             completed += 1;
         }
         reader.release();
     }
-    if completed > 0 || available > 0{
-        //info!("{} completed/available: {}/{}",queue_id_ifidx, completed, available);
+
+    for (queue_idx, addr_list) in addr_map{
+        if let Some(completed) = complete_address_list.get(&queue_idx){
+            completed.lock().unwrap().extend(addr_list);
+        } else {
+            error!("failed to get address list for queue_idx: {}", queue_idx);
+        }
     }
-    Ok(desc_map)
+
+    Ok(completed)
 }
 
-fn fill(fq_cq: &Arc<Mutex<DeviceQueue>>, desc_list: Vec<u64>, queue_id_ifidx: String) -> anyhow::Result<()>{
-    let mut fq_cq = fq_cq.lock().unwrap();
-    {
-        let mut writer = fq_cq.fill(desc_list.len() as u32);
-        writer.insert(desc_list.iter().map(|k| k.clone()));
-        writer.commit();
-    }
-    //info!("{} filled: {}",queue_id_ifidx, desc_list.len());
-    Ok(())
+fn fill(fq_cq: &mut std::sync::MutexGuard<'_, DeviceQueue>, desc_list: Vec<u64>, queue_id_ifidx: String) -> anyhow::Result<u32>{
+    //let mut fq_cq = fq_cq.lock().unwrap();    
+    let mut writer = fq_cq.fill(desc_list.len() as u32);
+    let filled = writer.insert(desc_list.iter().map(|k| k.clone()));
+    writer.commit();
+    Ok(filled)
 }
 
 fn pending(fq_cq: &Arc<Mutex<DeviceQueue>>) -> anyhow::Result<u32>{
