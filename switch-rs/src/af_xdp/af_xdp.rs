@@ -14,14 +14,14 @@ use super::interface::interface::Interface;
 
 
 //const BUFFER_SIZE: u32 = 1 << 16;
-const BATCH_SIZE: u32 = 256;
+const BATCH_SIZE: u32 = 64;
 const FRAME_SIZE: u32 = 1 << 12;
 const HEADROOM: u32 = 1 << 8;
 const PAYLOAD_SIZE: u32 = FRAME_SIZE - HEADROOM;
 const BUFFER_SIZE: u32 = 1 << 24;
-const THRESOLD_FACTOR: u32 = 4;
-const RX_INTERVAL: u64 = 300;
-const COMPLETE_INTERVAL: u64 = 100;
+const THRESOLD_FACTOR: u32 = 8;
+const RX_INTERVAL: u64 = 50;
+const COMPLETE_INTERVAL: u64 = 10;
 #[repr(align(4096))]
 struct PacketMap(MaybeUninit<[u8; BUFFER_SIZE as usize]>);
 
@@ -360,24 +360,28 @@ impl Queue{
         let complete_address_list_clone = self.complete_address_list.clone();
         
         let jh = tokio::spawn(async move{
-            let mut collect_interval = tokio::time::interval(Duration::from_micros(COMPLETE_INTERVAL));
+            let mut collect_interval = tokio::time::interval(Duration::from_nanos(COMPLETE_INTERVAL));
             let mut complete_now = tokio::time::Instant::now();
             let mut complete_total = 0;
-            let mut res_map = HashMap::new();
+            let mut complete_list_total = 0;
+            let mut complete_counter_map = HashMap::new();
+            //let mut res_map = HashMap::new();
             
             loop{
                 collect_interval.tick().await;
-                let (completed, res) = complete(&fq_cq_clone, total_queues_clone, queue_id_ifidx_clone.clone(), complete_address_list_clone.clone()).unwrap();
+                let (completed, res) = complete(&fq_cq_clone, total_queues_clone, queue_id_ifidx_clone.clone()).unwrap();
                 complete_total += completed;
-                for (queue_idx, count) in res{
-                    if let Some(counter) = res_map.get_mut(&queue_idx){
-                        *counter += count;
+                for (queue_idx, addr_list) in res{
+                    if let Some(counter) = complete_counter_map.get_mut(&queue_idx){
+                        *counter += addr_list.len() as u64;
                     } else {
-                        res_map.insert(queue_idx, count);
+                        complete_counter_map.insert(queue_idx, addr_list.len() as u64);
                     }
+                    complete_list_total += addr_list.len();
+                    complete_address_list_clone.get(&queue_idx).unwrap().lock().unwrap().append(&mut addr_list.into());
                 }
                 if complete_now.elapsed() > tokio::time::Duration::from_secs(2){
-                    info!("{} complete total: {}, res_map {:?}", queue_id_ifidx_clone, complete_total, res_map);
+                    info!("{} complete total: {}, complete_list_total {}, counter_map: {:?}", queue_id_ifidx_clone, complete_total, complete_list_total, complete_counter_map);
                     complete_now = tokio::time::Instant::now();
                 }
             }
@@ -389,7 +393,7 @@ impl Queue{
         let complete_list = self.complete_list.clone();
 
         let jh = tokio::spawn(async move{
-            let mut receive_interval = tokio::time::interval(Duration::from_micros(RX_INTERVAL));
+            let mut receive_interval = tokio::time::interval(Duration::from_nanos(RX_INTERVAL));
             let mut pending_now = tokio::time::Instant::now();
             let mut local_mac_table: HashMap<[u8;6], u32> = HashMap::new();
             let mac_table = mac_table.read().await;
@@ -407,6 +411,7 @@ impl Queue{
                 }
             }
             let mut fill_list = VecDeque::new();
+            let mut idle_timer = tokio::time::Instant::now();
 
             loop{
                 receive_interval.tick().await;
@@ -415,34 +420,38 @@ impl Queue{
                 
                 if pending_now.elapsed() > tokio::time::Duration::from_secs(2){
                     let pending_cnt =  pending(&mut fq_cq).unwrap();
-                    info!("{} 1 pending: {}, total_receive {}, total_fill {}, total_fill_list {}, total_sent {}", 
-                        queue_id_ifidx, pending_cnt, total_receive_counter, total_fill_counter, total_fill_list_counter, total_sent_counter);
+                    let complete_fill_list = complete_list.lock().unwrap();
+
+                    info!("{} 1 pending: {}, total_receive {}, total_fill {}, total_fill_list {}, total_sent {}, complete_fill_list: {}", 
+                        queue_id_ifidx, pending_cnt, total_receive_counter, total_fill_counter, total_fill_list_counter, total_sent_counter, complete_fill_list.len());
                     pending_now = tokio::time::Instant::now();
+                    drop(complete_fill_list)
                 }
 
                 if receive_counter > thresholds{
                     //let mut filled = 0;
                     //let now = tokio::time::Instant::now();
-                    let mut fill_list: VecDeque<u64> = complete_list.lock().unwrap().drain(0..).collect();
-                    total_fill_list_counter += fill_list.len();
+                    let mut complete_fill_list: VecDeque<u64> = complete_list.lock().unwrap().drain(0..).collect();
+                    total_fill_list_counter += complete_fill_list.len();
                     loop{
                         let mut failed_list = VecDeque::new();
-                        let filled_temp = fill(&mut fq_cq, &mut fill_list, &mut failed_list, queue_id_ifidx.clone()).unwrap();
+                        let filled_temp = fill(&mut fq_cq, &mut complete_fill_list, &mut failed_list, queue_id_ifidx.clone()).unwrap();
                         //filled += filled_temp;
                         total_fill_counter += filled_temp;
                         if failed_list.len() == 0{
                             break;
                         }
-                        fill_list = failed_list;
+                        complete_fill_list = failed_list;
                     }
+                    drop(complete_fill_list);
                     //let elapsed = now.elapsed();
                     receive_counter = 0;
                 }
 
                 let mut receiver = ring_rx.receive(BATCH_SIZE);
                 let mut batch_counter = 0;
-                
                 while let Some(desc) = receiver.read() {
+                    idle_timer = tokio::time::Instant::now();
                     receive_counter += 1;
                     batch_counter += 1;
                     total_receive_counter += 1;
@@ -511,6 +520,22 @@ impl Queue{
                     }
                 }
 
+                if idle_timer.elapsed() > tokio::time::Duration::from_secs(2){
+                    let mut complete_fill_list: VecDeque<u64> = complete_list.lock().unwrap().drain(0..).collect();
+                    total_fill_list_counter += complete_fill_list.len();
+                    loop{
+                        let mut failed_list = VecDeque::new();
+                        let filled_temp = fill(&mut fq_cq, &mut complete_fill_list, &mut failed_list, queue_id_ifidx.clone()).unwrap();
+                        //filled += filled_temp;
+                        total_fill_counter += filled_temp;
+                        if failed_list.len() == 0{
+                            break;
+                        }
+                        complete_fill_list = failed_list;
+                    }
+                    drop(complete_fill_list);
+                }
+
 
                 if batch_counter > 0{
                     //info!("{} batch received: {}, total {}", queue_id_ifidx, batch_counter, total_receive_counter);
@@ -560,8 +585,22 @@ impl Queue{
 
                 let pending_cnt =  pending(&mut fq_cq).unwrap();
                 if pending_cnt <= thresholds{
-                    info!("{} 2 pending: {} threshold: {}", queue_id_ifidx, pending_cnt, thresholds);
-                    panic!("pending is 0");
+                    
+                    
+                    let mut complete_fill_list: VecDeque<u64> = complete_list.lock().unwrap().drain(0..).collect();
+                    info!("{} 2 pending: {} threshold: {}, complete_fill_list: {}", queue_id_ifidx, pending_cnt, thresholds, complete_fill_list.len());
+                    total_fill_list_counter += complete_fill_list.len();
+                    loop{
+                        let mut failed_list = VecDeque::new();
+                        let filled_temp = fill(&mut fq_cq, &mut complete_fill_list, &mut failed_list, queue_id_ifidx.clone()).unwrap();
+                        //filled += filled_temp;
+                        total_fill_counter += filled_temp;
+                        if failed_list.len() == 0{
+                            break;
+                        }
+                        complete_fill_list = failed_list;
+                    }
+                    drop(complete_fill_list);
                 }
 
             }
@@ -600,10 +639,10 @@ fn send(descriptors: &mut VecDeque<XdpDesc>, failed: &mut VecDeque<XdpDesc>, rin
     Ok(sent)
 }
 
-fn complete(fq_cq: &Arc<Mutex<DeviceQueue>>, total_queues: u32, queue_id_ifidx: String, complete_address_list: HashMap<u64, Arc<Mutex<VecDeque<u64>>>>) -> anyhow::Result<(u32, Vec<(u64, usize)>)>{
+fn complete(fq_cq: &Arc<Mutex<DeviceQueue>>, total_queues: u32, queue_id_ifidx: String) -> anyhow::Result<(u32,HashMap<u64, Vec<u64>>)>{
     let mut fq_cq = fq_cq.lock().unwrap();
     let mut completed = 0;
-    //let mut addr_map: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut addr_map: HashMap<u64, Vec<u64>> = HashMap::new();
     let available = fq_cq.available();
     
     let mut reader = fq_cq.complete(available);
@@ -613,36 +652,17 @@ fn complete(fq_cq: &Arc<Mutex<DeviceQueue>>, total_queues: u32, queue_id_ifidx: 
         //info!("{} Read descriptor with address: {}",queue_id_ifidx_clone, desc);
         let interval = BUFFER_SIZE/total_queues;
         let queue_idx = addr/interval as u64;
-        let queue_idx = queue_idx.min(total_queues as u64-1);
-        let mut completed_list = complete_address_list.get(&queue_idx).unwrap().lock().unwrap();
-        completed_list.push_back(addr);
-
-        /*
+        let queue_idx = queue_idx.min(total_queues as u64-1);        
         if let Some(addr_list) = addr_map.get_mut(&queue_idx){
             addr_list.push(addr);
         } else {
             addr_map.insert(queue_idx, vec![addr]);
         }
-        */
+        
         completed += 1;
     }
     reader.release();
-
-    let mut res: Vec<(u64, usize)> = Vec::new();
-
-    /*
-    for (queue_idx, addr_list) in addr_map{
-        if let Some(completed) = complete_address_list.get(&queue_idx){
-            res.push((queue_idx, addr_list.len()));
-            completed.lock().unwrap().extend(addr_list);
-            
-        } else {
-            error!("failed to get address list for queue_idx: {}", queue_idx);
-        }
-    }
-    */
-
-    Ok((completed, res))
+    Ok((completed, addr_map))
 }
 
 fn fill(fq_cq: &mut std::sync::MutexGuard<'_, DeviceQueue>, desc_list: &mut VecDeque<u64>, failed: &mut VecDeque<u64>, queue_id_ifidx: String) -> anyhow::Result<u32>{
