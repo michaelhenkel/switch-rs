@@ -127,13 +127,16 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
     }
     
     
+    
     /*
     
     let dmac = unsafe { (*eth_hdr).dst_addr };
     let interface = unsafe { MACTABLE.get(&dmac).ok_or(xdp_action::XDP_ABORTED)? };
     let res = unsafe { bpf_redirect(*interface, 0)};
     Ok(res as u32)
+
     */
+    
     
     
     

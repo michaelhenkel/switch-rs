@@ -1,7 +1,6 @@
 use core::{mem::MaybeUninit, num::NonZeroU32, ptr::NonNull};
 use std::{collections::{HashMap, VecDeque}, sync::{Arc, Mutex}, time::Duration};
 use anyhow::anyhow;
-use std::hash::Hash;
 use pnet::packet::{arp::{ArpOperations, ArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, Packet};
 use switch_rs_common::InterfaceQueue;
 use tokio::sync::RwLock;
@@ -9,9 +8,7 @@ use xdpilone::{xdp::XdpDesc, DeviceQueue, RingRx, RingTx};
 use aya::maps::{HashMap as BpfHashMap, MapData, XskMap};
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 use log::{error, info};
-
 use super::interface::interface::Interface;
-
 
 //const BUFFER_SIZE: u32 = 1 << 16;
 const BATCH_SIZE: u32 = 64;
@@ -133,8 +130,6 @@ impl QueueManager{
     }
     pub async fn run(&mut self) -> anyhow::Result<()>{
         let mut queue_list = Vec::new();
-        let mut queue_client_map = HashMap::new();
-        let mut address_queue_map = HashMap::new();
         let mut ring_tx_map = HashMap::new();
         let mut complete_counter_map = HashMap::new();
         let mut complete_address_list: HashMap<u64, Arc<Mutex<VecDeque<u64>>>> = HashMap::new();
@@ -199,11 +194,7 @@ impl QueueManager{
                             }
                         };
                         let recv_buf = unsafe { recv_frame.addr.as_mut() };
-                        let interval_size = BUFFER_SIZE/total_queues;
-                        let queue_index = recv_frame.offset/interval_size as u64;
-                        let queue_index = queue_index.min(total_queues as u64-1);
                         frame_buffer.insert(recv_frame.offset, recv_buf);
-                        address_queue_map.insert(queue_index, (interface.ifidx, queue_id));
                     }
                     {
                         info!("filling fq_cq with {} frames, fb length: {}", fq_size, frame_buffer.len());
@@ -219,7 +210,6 @@ impl QueueManager{
                     info!("queue: {},{} available {}", interface.ifidx, queue_id, fq_cq.available());
                     let complete_list = Arc::new(Mutex::new(VecDeque::new()));
                     let queue = Queue::new(
-                        idx,
                         (queue_frame_start  * FRAME_SIZE) as u64,
                         (queue_frame_end * FRAME_SIZE) as u64,
                         queue_id,
@@ -233,7 +223,6 @@ impl QueueManager{
                     );
                     
                     ring_tx_map.insert((interface.ifidx, queue_id), Arc::new(Mutex::new(ring_tx)));
-                    queue_client_map.insert((interface.ifidx, queue_id), queue.client());
                     complete_counter_map.insert(idx as u64, 0);
                     complete_address_list.insert(idx as u64, complete_list);
                     queue_list.push((queue, ring_rx, frame_buffer));
@@ -248,14 +237,11 @@ impl QueueManager{
             info!("starting queue: {},{}", queue.ifidx, queue.queue_id);
             info!("frame buffer len: {}", frame_buffer.len());
             info!("start: {} end: {}", queue.buf_start, queue.buf_end);
-            info!("address queue map: {:?}", address_queue_map);
-            let queue_client_map = queue_client_map.clone();
-            let address_queue_map = address_queue_map.clone();
             let ring_tx_map = ring_tx_map.clone();
             queue.complete_counter_map = complete_counter_map.clone();
             queue.complete_address_list = complete_address_list.clone();
             let jh = tokio::spawn(async move{
-                queue.run(frame_buffer, ring_rx, ring_tx_map, queue_client_map, address_queue_map).await.unwrap();
+                queue.run(frame_buffer, ring_rx, ring_tx_map).await.unwrap();
             });
             jh_list.push(jh);
         }
@@ -267,20 +253,13 @@ impl QueueManager{
 }
 
 struct Queue{
-    id: u32,
     buf_start: u64,
     buf_end: u64,
     totol_queues: u32,
-    sent_packets: u32,
-    //received_packets: u32,
-    //completed_packets: u32,
     fq_cq: Arc<Mutex<DeviceQueue>>,
     thresholds: u32,
     queue_id: u32,
     ifidx: u32,
-    client: QueueClient,
-    sender_rx: Arc<RwLock<tokio::sync::mpsc::Receiver<QueueCommand>>>,
-    sender2_rx: Arc<RwLock<tokio::sync::mpsc::Receiver<XdpDesc>>>,
     interface_list: HashMap<u32, Interface>,
     mac_table: Arc<RwLock<BpfHashMap<MapData, [u8;6], u32>>>,
     complete_counter_map: Arc<Mutex<HashMap<u64, u64>>>,
@@ -290,7 +269,6 @@ struct Queue{
 
 impl Queue{
     fn new(
-        id: u32,
         buf_start: u64,
         buf_end: u64,
         queue_id: u32,
@@ -302,21 +280,14 @@ impl Queue{
         totol_queues: u32,
         complete_list: Arc<Mutex<VecDeque<u64>>>,
     ) -> Self{
-        let (sender_tx, sender_rx) = tokio::sync::mpsc::channel(100);
-        let (sender2_tx, sender2_rx) = tokio::sync::mpsc::channel(100);
         Queue{
-            id,
             buf_start,
             buf_end,
             totol_queues,
-            sent_packets: 0,
             thresholds,
             queue_id,
             fq_cq,
             ifidx,
-            client: QueueClient::new(sender_tx, sender2_tx),
-            sender_rx: Arc::new(RwLock::new(sender_rx)),
-            sender2_rx: Arc::new(RwLock::new(sender2_rx)),
             interface_list,
             mac_table,
             complete_counter_map: Arc::new(Mutex::new(HashMap::new())),
@@ -324,17 +295,12 @@ impl Queue{
             complete_list,
         }
     }
-    fn client(&self) -> QueueClient{
-        self.client.clone()
-    }
 
     pub async fn run(
         &self,
         mut frame_buffer: HashMap<u64, &'static mut [u8]>,
         mut ring_rx: RingRx,
         ring_tx_map: HashMap<(u32,u32), Arc<Mutex<RingTx>>>,
-        queue_client_map: HashMap<(u32, u32), QueueClient>,
-        address_queue_map: HashMap<u64, (u32, u32)>,
     ) -> anyhow::Result<()> {
         let mut jh_list = Vec::new();
 
@@ -343,47 +309,16 @@ impl Queue{
         let queue_id_ifidx = format!{"{}:{}", ifidx, queue_id};
         let thresholds = self.thresholds;
         let total_queues_clone = self.totol_queues;
-        let buf_start = self.buf_start;
-        let buf_end = self.buf_end;
-        let id = self.id;
-
-
         let interface_list = self.interface_list.clone();
         let fq_cq_clone = self.fq_cq.clone();
         let mac_table = self.mac_table.clone();
-        let address_queue_map_clone = address_queue_map.clone();
-
-        let queue_ifidx_clone = queue_id_ifidx.clone();
-        let queue_id_ifidx_clone = queue_id_ifidx.clone();
-        let interface_list_clone = self.interface_list.clone();
-        let complete_counter_map = self.complete_counter_map.clone();
-        let complete_address_list_clone = self.complete_address_list.clone();
+        let mut complete_address_list_clone = self.complete_address_list.clone();
         
         let jh = tokio::spawn(async move{
             let mut collect_interval = tokio::time::interval(Duration::from_nanos(COMPLETE_INTERVAL));
-            let mut complete_now = tokio::time::Instant::now();
-            let mut complete_total = 0;
-            let mut complete_list_total = 0;
-            let mut complete_counter_map = HashMap::new();
-            //let mut res_map = HashMap::new();
-            
             loop{
                 collect_interval.tick().await;
-                let (completed, res) = complete(&fq_cq_clone, total_queues_clone, queue_id_ifidx_clone.clone()).unwrap();
-                complete_total += completed;
-                for (queue_idx, addr_list) in res{
-                    if let Some(counter) = complete_counter_map.get_mut(&queue_idx){
-                        *counter += addr_list.len() as u64;
-                    } else {
-                        complete_counter_map.insert(queue_idx, addr_list.len() as u64);
-                    }
-                    complete_list_total += addr_list.len();
-                    complete_address_list_clone.get(&queue_idx).unwrap().lock().unwrap().append(&mut addr_list.into());
-                }
-                if complete_now.elapsed() > tokio::time::Duration::from_secs(2){
-                    info!("{} complete total: {}, complete_list_total {}, counter_map: {:?}", queue_id_ifidx_clone, complete_total, complete_list_total, complete_counter_map);
-                    complete_now = tokio::time::Instant::now();
-                }
+                let _completed = complete(&fq_cq_clone, total_queues_clone, &mut complete_address_list_clone).unwrap();
             }
         });
         jh_list.push(jh);
@@ -399,7 +334,6 @@ impl Queue{
             let mac_table = mac_table.read().await;
             let mut receive_counter = 0;
             let mut total_sent_counter = 0;
-            let mut drop_counter = 0;
             let mut total_receive_counter = 0;
             let mut total_fill_list_counter = 0;
             let mut total_fill_counter = 0;
@@ -417,26 +351,12 @@ impl Queue{
                 receive_interval.tick().await;
 
                 let mut fq_cq = fq_cq_clone.lock().unwrap();
-                
-                if pending_now.elapsed() > tokio::time::Duration::from_secs(2){
-                    let pending_cnt =  pending(&mut fq_cq).unwrap();
-                    let complete_fill_list = complete_list.lock().unwrap();
-
-                    info!("{} 1 pending: {}, total_receive {}, total_fill {}, total_fill_list {}, total_sent {}, complete_fill_list: {}", 
-                        queue_id_ifidx, pending_cnt, total_receive_counter, total_fill_counter, total_fill_list_counter, total_sent_counter, complete_fill_list.len());
-                    pending_now = tokio::time::Instant::now();
-                    drop(complete_fill_list)
-                }
-
                 if receive_counter > thresholds{
-                    //let mut filled = 0;
-                    //let now = tokio::time::Instant::now();
                     let mut complete_fill_list: VecDeque<u64> = complete_list.lock().unwrap().drain(0..).collect();
                     total_fill_list_counter += complete_fill_list.len();
                     loop{
                         let mut failed_list = VecDeque::new();
-                        let filled_temp = fill(&mut fq_cq, &mut complete_fill_list, &mut failed_list, queue_id_ifidx.clone()).unwrap();
-                        //filled += filled_temp;
+                        let filled_temp = fill(&mut fq_cq, &mut complete_fill_list, &mut failed_list).unwrap();
                         total_fill_counter += filled_temp;
                         if failed_list.len() == 0{
                             break;
@@ -444,7 +364,6 @@ impl Queue{
                         complete_fill_list = failed_list;
                     }
                     drop(complete_fill_list);
-                    //let elapsed = now.elapsed();
                     receive_counter = 0;
                 }
 
@@ -455,8 +374,6 @@ impl Queue{
                     receive_counter += 1;
                     batch_counter += 1;
                     total_receive_counter += 1;
-
-                    //info!("{} Received descriptor with address {}", queue_id_ifidx.clone(), desc.addr);
                     let buf_idx = (desc.addr / FRAME_SIZE as u64) * FRAME_SIZE as u64;
                     let offset = desc.addr - buf_idx;
 
@@ -525,7 +442,7 @@ impl Queue{
                     total_fill_list_counter += complete_fill_list.len();
                     loop{
                         let mut failed_list = VecDeque::new();
-                        let filled_temp = fill(&mut fq_cq, &mut complete_fill_list, &mut failed_list, queue_id_ifidx.clone()).unwrap();
+                        let filled_temp = fill(&mut fq_cq, &mut complete_fill_list, &mut failed_list).unwrap();
                         //filled += filled_temp;
                         total_fill_counter += filled_temp;
                         if failed_list.len() == 0{
@@ -551,7 +468,7 @@ impl Queue{
                     if let Some(ring_tx) = ring_tx_map.get(&(*ifidx, *queue_id)){
                         loop {
                             let mut failed_list = VecDeque::new();
-                            let sent = send(&mut desc_list, &mut failed_list, ring_tx, queue_id_ifidx.clone()).unwrap();
+                            let sent = send(&mut desc_list, &mut failed_list, ring_tx).unwrap();
                             total_sent_counter += sent;
                             if failed_list.len() == 0{
                                 break;
@@ -569,7 +486,7 @@ impl Queue{
                 if fill_list.len() > thresholds as usize{ 
                     loop{
                         let mut failed_list = VecDeque::new();
-                        let filled_temp = fill(&mut fq_cq, &mut fill_list, &mut failed_list, queue_id_ifidx.clone()).unwrap();
+                        let filled_temp = fill(&mut fq_cq, &mut fill_list, &mut failed_list).unwrap();
                         if failed_list.len() == 0{
                             break;
                         }
@@ -592,7 +509,7 @@ impl Queue{
                     total_fill_list_counter += complete_fill_list.len();
                     loop{
                         let mut failed_list = VecDeque::new();
-                        let filled_temp = fill(&mut fq_cq, &mut complete_fill_list, &mut failed_list, queue_id_ifidx.clone()).unwrap();
+                        let filled_temp = fill(&mut fq_cq, &mut complete_fill_list, &mut failed_list).unwrap();
                         //filled += filled_temp;
                         total_fill_counter += filled_temp;
                         if failed_list.len() == 0{
@@ -612,13 +529,7 @@ impl Queue{
     
 }
 
-fn getter<T, F>(map: &HashMap<T, F>, key: T) -> Option<&F>
-where T: Hash, T: std::cmp::Eq
-{
-    map.get(&key).map(|v| v)
-}
-
-fn send(descriptors: &mut VecDeque<XdpDesc>, failed: &mut VecDeque<XdpDesc>, ring_tx: &Arc<Mutex<RingTx>>, queue_id_ifidx: String) -> anyhow::Result<u32>{
+fn send(descriptors: &mut VecDeque<XdpDesc>, failed: &mut VecDeque<XdpDesc>, ring_tx: &Arc<Mutex<RingTx>>) -> anyhow::Result<u32>{
     let mut ring_tx = ring_tx.lock().unwrap();
     let mut sent = 0;
     {
@@ -639,10 +550,9 @@ fn send(descriptors: &mut VecDeque<XdpDesc>, failed: &mut VecDeque<XdpDesc>, rin
     Ok(sent)
 }
 
-fn complete(fq_cq: &Arc<Mutex<DeviceQueue>>, total_queues: u32, queue_id_ifidx: String) -> anyhow::Result<(u32,HashMap<u64, Vec<u64>>)>{
+fn complete(fq_cq: &Arc<Mutex<DeviceQueue>>, total_queues: u32, complete_address_list: &mut HashMap<u64, Arc<Mutex<VecDeque<u64>>>>) -> anyhow::Result<u32>{
     let mut fq_cq = fq_cq.lock().unwrap();
     let mut completed = 0;
-    let mut addr_map: HashMap<u64, Vec<u64>> = HashMap::new();
     let available = fq_cq.available();
     
     let mut reader = fq_cq.complete(available);
@@ -652,20 +562,15 @@ fn complete(fq_cq: &Arc<Mutex<DeviceQueue>>, total_queues: u32, queue_id_ifidx: 
         //info!("{} Read descriptor with address: {}",queue_id_ifidx_clone, desc);
         let interval = BUFFER_SIZE/total_queues;
         let queue_idx = addr/interval as u64;
-        let queue_idx = queue_idx.min(total_queues as u64-1);        
-        if let Some(addr_list) = addr_map.get_mut(&queue_idx){
-            addr_list.push(addr);
-        } else {
-            addr_map.insert(queue_idx, vec![addr]);
-        }
-        
+        let queue_idx = queue_idx.min(total_queues as u64-1);
+        complete_address_list.get(&queue_idx).unwrap().lock().unwrap().push_back(addr);        
         completed += 1;
     }
     reader.release();
-    Ok((completed, addr_map))
+    Ok(completed)
 }
 
-fn fill(fq_cq: &mut std::sync::MutexGuard<'_, DeviceQueue>, desc_list: &mut VecDeque<u64>, failed: &mut VecDeque<u64>, queue_id_ifidx: String) -> anyhow::Result<u32>{
+fn fill(fq_cq: &mut std::sync::MutexGuard<'_, DeviceQueue>, desc_list: &mut VecDeque<u64>, failed: &mut VecDeque<u64>) -> anyhow::Result<u32>{
     let mut writer = fq_cq.fill(desc_list.len() as u32);
     let mut filled = 0;
     while let Some(addr) = desc_list.pop_front(){
@@ -684,57 +589,3 @@ fn pending(fq_cq: &mut std::sync::MutexGuard<'_, DeviceQueue>) -> anyhow::Result
     let pending = fq_cq.pending();
     Ok(pending)
 }
-
-fn available(fq_cq: &Arc<Mutex<DeviceQueue>>) -> anyhow::Result<u32>{
-    let fq_cq = fq_cq.lock().unwrap();
-    let available = fq_cq.available();
-    Ok(available)
-}
-
-#[derive(Clone)]
-struct QueueClient{
-    sender_tx: tokio::sync::mpsc::Sender<QueueCommand>,
-    sender2_tx: tokio::sync::mpsc::Sender<XdpDesc>,
-}
-
-impl QueueClient{
-    fn new(sender_tx: tokio::sync::mpsc::Sender<QueueCommand>, sender2_tx: tokio::sync::mpsc::Sender<XdpDesc>) -> Self{
-        QueueClient{
-            sender_tx,
-            sender2_tx,
-        }
-    }
-    async fn send(&self, descriptor: XdpDesc) -> anyhow::Result<()>{
-        self.sender2_tx.send(descriptor).await.unwrap();
-        Ok(())
-    }
-    async fn complete(&self, count: u32) -> anyhow::Result<()>{
-        self.sender_tx.send(QueueCommand::Complete(count)).await.unwrap();
-        Ok(())
-    }
-    async fn fill(&self, desc_list: Vec<u64>) -> anyhow::Result<()>{
-        self.sender_tx.send(QueueCommand::Fill(desc_list)).await.unwrap();
-        Ok(())
-    }
-    async fn pending(&self) -> Option<u32>{
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        self.sender_tx.send(QueueCommand::Pending{tx}).await.unwrap();
-        rx.recv().await
-    }
-}
-
-enum QueueCommand{
-    Complete(u32),
-    Fill(Vec<u64>),
-    Pending{
-        tx: tokio::sync::mpsc::Sender<u32>
-    }
-}
-
-enum CounterCommad{
-    Sent(u32),
-    Received,
-
-    //Completed,
-}
-
