@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use aya::maps::{MapData, XskMap};
 use aya::programs::{Xdp, XdpFlags};
@@ -8,13 +9,17 @@ use clap::Parser;
 use env_logger::fmt;
 use log::{debug, info, warn};
 use tokio::signal;
-use switch_rs_common::{InterfaceConfig, InterfaceQueue};
+use switch_rs_common::{FlowKey, FlowNextHop, InterfaceConfig, InterfaceQueue};
 use af_xdp::{
     interface::interface::{get_interface_index, get_interface_mac},
-    af_xdp::AfXdp
+    af_xdp::AfXdp,
+    af_xdp::PacketHandler,
 };
 use crate::af_xdp::interface::interface::Interface;
+
 pub mod af_xdp;
+pub mod cli;
+pub mod handler;
 
 
 #[derive(Debug, Parser)]
@@ -67,7 +72,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let program: &mut Xdp = bpf.program_mut("switch_rs").unwrap().try_into()?;
     program.load()?;
     for iface in &opt.ifaces {
-        program.attach(&iface, XdpFlags::default())
+        program.attach(&iface, XdpFlags::DRV_MODE)
             .context(format!("failed to attach the XDP program to interface {}", iface))?;
     }
 
@@ -114,49 +119,34 @@ async fn main() -> Result<(), anyhow::Error> {
         panic!("MACTABLE map not found");
     };
 
-    
+    let flow_table = if let Some(flow_table) = bpf.take_map("FLOWTABLE"){
+        let flow_table: BpfHashMap<MapData, FlowKey, FlowNextHop> = BpfHashMap::try_from(flow_table).unwrap();
+        flow_table
+    } else {
+        panic!("FLOWTABLE map not found");
+    };
+
+    let mac_table_mutex = Arc::new(Mutex::new(mac_table));
+    let flow_table_mutex = Arc::new(Mutex::new(flow_table));
+    let handler = handler::handler::Handler::new(interface_list.clone(), mac_table_mutex, flow_table_mutex);
     let afxdp = AfXdp::new(interface_list.clone(), xsk_map, interface_queue_table);
-    //let afxdp_client = afxdp.client();
-    //let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let mut jh_list = Vec::new();
+    let handler_clone = handler.clone();
     let jh = tokio::spawn(async move {
-        afxdp.run(mac_table).await.unwrap();
+        handler.run().await.unwrap();
+    });
+    jh_list.push(jh);
+    let jh = tokio::spawn(async move {
+        afxdp.run(handler_clone).await.unwrap();
     });
     jh_list.push(jh);
     
     info!("Waiting for Ctrl-C...");
     futures::future::join_all(jh_list).await;
-    //kernel_handler(interface_list).await?;
     signal::ctrl_c().await?;
     info!("Exiting...");
 
     Ok(())
 }
 
-/*
-async fn kernel_handler(interface_list: HashMap<u32, Interface>) -> anyhow::Result<()>{
-    let mut receiver_list = HashMap::new();
-    let mut sender_list = HashMap::new();
-    for (ifidx, interface) in &interface_list{
-        let network_interface = pnet::datalink::interfaces().into_iter().find(|iface| iface.name == interface.name).ok_or(anyhow::anyhow!("failed to find interface {}", interface.name))?;
-        let (sender, receiver) = match pnet::datalink::channel(&network_interface, Default::default()) {
-            Ok(pnet::datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
-            Ok(_) => panic!("Unknown channel type"),
-            Err(e) => panic!("Error happened {}", e),
-        };
-        receiver_list.insert(*ifidx, receiver);
-        sender_list.insert(*ifidx, Arc::new(Mutex::new(sender)));
-    }
-    let mut jh_list = Vec::new();
-    for (ifidx, receiver) in receiver_list{
-        let interface_list = interface_list.clone();
-        let sender_list = sender_list.clone();
-        let jh = tokio::spawn(async move {
-            receive_packet(receiver, interface_list, ifidx, sender_list).await.unwrap();
-        });
-        jh_list.push(jh);
-    }
-    futures::future::join_all(jh_list).await;
-    Ok(())
-}
-*/
+

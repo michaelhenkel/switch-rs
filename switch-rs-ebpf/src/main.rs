@@ -3,7 +3,7 @@
 
 use core::mem;
 use aya_bpf::{
-    bindings::xdp_action,
+    bindings::xdp_action::{self, XDP_REDIRECT},
     helpers::bpf_redirect,
     macros::{map, xdp},
     maps::{HashMap, XskMap},
@@ -11,8 +11,19 @@ use aya_bpf::{
     
 };
 use aya_log_ebpf::info;
-use network_types::eth::{EthHdr, EtherType};
-use switch_rs_common::{ArpHdr, InterfaceConfig, InterfaceQueue};
+use network_types::{
+    eth::{EthHdr, EtherType},
+    ip::{IpProto, Ipv4Hdr},
+    tcp::TcpHdr,
+    udp::UdpHdr,
+};
+use switch_rs_common::{
+    ArpHdr,
+    InterfaceConfig,
+    InterfaceQueue,
+    FlowKey,
+    FlowNextHop,
+};
 
 #[map(name = "INTERFACEMAP")]
 static mut INTERFACEMAP: HashMap<u32, InterfaceConfig> =
@@ -32,6 +43,10 @@ static mut XSKMAP: XskMap = XskMap::with_max_entries(256, 0);
 #[map(name = "INTERFACEQUEUETABLE")]
 static mut INTERFACEQUEUETABLE: HashMap<InterfaceQueue, u32> =
     HashMap::<InterfaceQueue, u32>::with_max_entries(256, 0);
+
+#[map(name = "FLOWTABLE")]
+static mut FLOWTABLE: HashMap<FlowKey, FlowNextHop> =
+    HashMap::<FlowKey, FlowNextHop>::with_max_entries(65535, 0);
 
 #[xdp]
 pub fn switch_rs(ctx: XdpContext) -> u32 {
@@ -105,6 +120,60 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
             }
         }
     }
+
+    if unsafe { (*eth_hdr).ether_type } == EtherType::Ipv4 {
+        let ipv4_hdr = match ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN){
+            Some(ipv4_hdr) => ipv4_hdr,
+            None => {
+                info!(&ctx,"failed to get IPv4 header from packet at offset {}", EthHdr::LEN);
+                return Ok(xdp_action::XDP_ABORTED);
+            }
+        };
+        let ip_proto = unsafe { (*ipv4_hdr).proto };
+        let source_dest_port = match ip_proto{
+            IpProto::Tcp => {
+                let tcp_hdr = match ptr_at::<TcpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN){
+                    Some(tcp_hdr) => tcp_hdr,
+                    None => {
+                        info!(&ctx,"failed to get TCP header from packet at offset {}", EthHdr::LEN + Ipv4Hdr::LEN);
+                        return Ok(xdp_action::XDP_ABORTED);
+                    }
+                };
+                let src_port = unsafe { (*tcp_hdr).source };
+                let dst_port = unsafe { (*tcp_hdr).dest };
+                Some((src_port, dst_port))
+            },
+            IpProto::Udp => {
+                let udp_hdr = match ptr_at::<UdpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN){
+                    Some(udp_hdr) => udp_hdr,
+                    None => {
+                        info!(&ctx,"failed to get UDP header from packet at offset {}", EthHdr::LEN + Ipv4Hdr::LEN);
+                        return Ok(xdp_action::XDP_ABORTED);
+                    }
+                };
+                let src_port = unsafe { (*udp_hdr).source };
+                let dst_port = unsafe { (*udp_hdr).dest };
+                Some((src_port, dst_port))
+            },
+            IpProto::Icmp => {
+                Some((0, 0))
+            },
+            _ => None,
+        };
+        if let Some((source, dest)) = source_dest_port{
+            let flow_key = FlowKey{
+                src_ip: u32::from_be(unsafe { (*ipv4_hdr).src_addr }),
+                dst_ip: u32::from_be(unsafe { (*ipv4_hdr).dst_addr }),
+                src_port: u16::from_be(source),
+                dst_port: u16::from_be(dest),
+            };
+
+            if let Some(flow_next_hop) = unsafe { FLOWTABLE.get(&flow_key) }{
+                let res = unsafe { bpf_redirect(flow_next_hop.ifidx, 0)};
+                return Ok(res as u32)
+            }
+        }
+    }
     
     
     let queue = unsafe { (*ctx.ctx).rx_queue_index };
@@ -117,7 +186,6 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
     };
     match unsafe { XSKMAP.redirect(*queue_idx, 0) }{
         Ok(res) => {
-            //info!(&ctx,"received packet on intf/queue {}/{}, redirecting to queue {}",ingress_if_idx,queue, *queue_idx);
             Ok(res)
         },
         Err(e) => {
