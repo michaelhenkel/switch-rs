@@ -1,9 +1,10 @@
 use std::{collections::HashMap, hash::Hash, net::{IpAddr, Ipv4Addr}, sync::{Arc, Mutex}};
+use async_trait::async_trait;
 use log::{error, info};
 use pnet::{ipnetwork::IpNetwork, packet::{arp::{self, ArpOperations, ArpPacket, MutableArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, ip::{IpNextHeaderProtocol, IpNextHeaderProtocols}, ipv4::Ipv4Packet, Packet}};
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use switch_rs_common::{FlowKey, FlowNextHop};
-use crate::af_xdp::{af_xdp::PacketHandler, interface::interface::Interface};
+use crate::{af_xdp::{af_xdp::PacketHandler, interface::interface::Interface}, network_state::network_state::NetworkStateClient};
 use rtnetlink::{new_connection, Error, IpVersion};
 use netlink_packet_route::{
     link::{InfoBridgePort, InfoPortData, InfoPortKind, LinkAttribute, LinkInfo, LinkMessage},
@@ -21,21 +22,25 @@ pub struct Handler{
     global_flow_table: Arc<Mutex<BpfHashMap<MapData, switch_rs_common::FlowKey, switch_rs_common::FlowNextHop>>>,
     rx: Arc<RwLock<tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>>>,
     tx: tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    network_state_client: NetworkStateClient,
 }
 
-
+#[async_trait]
 impl PacketHandler for Handler {
-    fn handle_packet(&mut self, buf: &mut [u8], ifidx: u32, queue_id: u32) -> Option<Vec<(u32, u32)>>{
+    async fn handle_packet(&mut self, buf: &mut [u8], ifidx: u32, queue_id: u32) -> Option<Vec<(u32, u32)>>{
         if let Some(mut eth_packet) = MutableEthernetPacket::new(buf){
-            info!("eth_packet: {:?}", eth_packet);
             match eth_packet.get_ethertype(){
                 EtherTypes::Arp => {
-                    return self.arp_handler(&mut eth_packet, ifidx, queue_id);
+                    info!("ARP packet");
+                    return self.arp_handler(&mut eth_packet, ifidx, queue_id).await;
                 },
                 EtherTypes::Ipv4 => {
+                    info!("IPv4 packet");
                     return self.ipv4_handler(eth_packet, queue_id, ifidx);
                 },
-                _ => {}
+                _ => {
+                    error!("ethertype not supported");
+                }
             }
         }
         None
@@ -65,7 +70,8 @@ impl Handler {
     }
     pub fn new(interface_list: HashMap<u32, Interface>,
         global_mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
-        global_flow_table: Arc<Mutex<BpfHashMap<MapData, switch_rs_common::FlowKey, switch_rs_common::FlowNextHop>>>
+        global_flow_table: Arc<Mutex<BpfHashMap<MapData, switch_rs_common::FlowKey, switch_rs_common::FlowNextHop>>>,
+        network_state_client: NetworkStateClient,
     ) -> Handler {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Handler{
@@ -75,15 +81,45 @@ impl Handler {
             global_flow_table,
             rx: Arc::new(RwLock::new(rx)),
             tx,
+            network_state_client,
         }
     }
-    fn arp_handler(&mut self, eth_packet: &mut MutableEthernetPacket<'_>, ifidx: u32, queue_id: u32) -> Option<Vec<(u32, u32)>>{
+    async fn arp_handler(&mut self, eth_packet: &mut MutableEthernetPacket<'_>, ifidx: u32, queue_id: u32) -> Option<Vec<(u32, u32)>>{
         let mut arp_packet = MutableArpPacket::new(eth_packet.payload_mut()).unwrap();
         let op = arp_packet.get_operation();
         match op{
             ArpOperations::Request => {
+                info!("ARP request");
+                let src_mac = arp_packet.get_sender_hw_addr();
+                // add sender mac to mac table
+                self.local_mac_table.insert(src_mac.into(), ifidx);
+
                 let mut ifidx_queue_id_list = Vec::new();
                 let target_ip = arp_packet.get_target_proto_addr();
+
+                // check if oif for target_ip is known
+                info!("trying to get ifdx from ip: {:?}", target_ip);
+                if let Some(dest_ifdx) = self.network_state_client.get_ifdx_from_ip(u32::from_be_bytes(target_ip.octets())).await{
+                    info!("dest_ifdx: {:?}", dest_ifdx);
+                    ifidx_queue_id_list.push((dest_ifdx, queue_id));
+                    return Some(ifidx_queue_id_list);
+                }
+
+                // check if target_ip is for us
+                info!("checking if target_ip {:#?} is for us", target_ip);
+                if let Some(bridge_id) = self.network_state_client.get_bridge_from_ip(u32::from_be_bytes(target_ip.octets())).await{
+                    info!("for us");
+                    arp_packet.set_operation(ArpOperations::Reply);
+                    arp_packet.set_sender_hw_addr(bridge_id.into());
+                    arp_packet.set_sender_proto_addr(target_ip);
+                    eth_packet.set_destination(eth_packet.get_source());
+                    eth_packet.set_source(bridge_id.into());
+                    //info!("eth_packet: {:#?}", eth_packet.packet());
+                    ifidx_queue_id_list.push((ifidx, queue_id));
+                    return Some(ifidx_queue_id_list);
+                }
+                info!("{:?} not for us", target_ip);
+
                 for (_, interface) in &self.interface_list{
                     if interface.ifidx == ifidx{
                         continue;

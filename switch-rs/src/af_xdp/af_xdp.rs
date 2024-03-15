@@ -1,8 +1,9 @@
 use core::{num::NonZeroU32, ptr::NonNull};
 use std::{cell::UnsafeCell, collections::{HashMap, VecDeque},sync::{Arc, Mutex}, time::Duration};
 use anyhow::anyhow;
+use async_trait::async_trait;
 use switch_rs_common::{FlowKey, FlowNextHop, InterfaceQueue};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockWriteGuard};
 use xdpilone::{xdp::XdpDesc, DeviceQueue, RingRx, RingTx};
 use aya::maps::{HashMap as BpfHashMap, MapData, XskMap};
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
@@ -25,6 +26,21 @@ unsafe impl Sync for PacketMap {}
 unsafe impl Send for PacketMap {}
 
 static MEM: PacketMap = PacketMap(UnsafeCell::new([0; BUFFER_SIZE as usize]));
+
+struct MyDeviceQueue(DeviceQueue);
+unsafe impl Send for MyDeviceQueue {}
+unsafe impl Sync for MyDeviceQueue {}
+
+struct SafeType {
+    inner: Mutex<MyDeviceQueue>,
+}
+
+impl SafeType {
+    fn some_method(&self) {
+        let locked = self.inner.lock();
+        // use ptr in `locked` to implement functionality, but don't return it
+    }
+}
 
 #[derive(Clone)]
 pub struct AfXdpClient{
@@ -214,7 +230,7 @@ impl QueueManager{
                         queue_id,
                         interface.ifidx,
                         self.interface_list.clone(),
-                        Arc::new(Mutex::new(fq_cq)),
+                        Arc::new(RwLock::new(MyDeviceQueue(fq_cq))),
                         threshold,
                         total_queues,
                         complete_list.clone(),
@@ -255,7 +271,7 @@ struct Queue{
     buf_start: u64,
     buf_end: u64,
     totol_queues: u32,
-    fq_cq: Arc<Mutex<DeviceQueue>>,
+    fq_cq: Arc<RwLock<MyDeviceQueue>>,
     thresholds: u32,
     queue_id: u32,
     ifidx: u32,
@@ -272,7 +288,7 @@ impl Queue{
         queue_id: u32,
         ifidx: u32,
         interface_list: HashMap<u32, Interface>,
-        fq_cq: Arc<Mutex<DeviceQueue>>,
+        fq_cq: Arc<RwLock<MyDeviceQueue>>,
         thresholds: u32,
         totol_queues: u32,
         complete_list: Arc<Mutex<VecDeque<u64>>>,
@@ -314,7 +330,7 @@ impl Queue{
             let mut collect_interval = tokio::time::interval(Duration::from_nanos(COMPLETE_INTERVAL));
             loop{
                 collect_interval.tick().await;
-                let mut fq_cq = fq_cq_clone.lock().unwrap();
+                let mut fq_cq = fq_cq_clone.write().await;
                 let _completed = complete(&mut fq_cq, total_queues_clone, &mut complete_address_list_clone).unwrap();
             }
         });
@@ -345,7 +361,7 @@ impl Queue{
             loop{
                 receive_interval.tick().await;
 
-                let mut fq_cq = fq_cq_clone.lock().unwrap();
+                let mut fq_cq = fq_cq_clone.write().await;
                 if receive_counter > thresholds{
                     let mut complete_fill_list: VecDeque<u64> = complete_list.lock().unwrap().drain(0..).collect();
                     total_fill_list_counter += complete_fill_list.len();
@@ -376,7 +392,7 @@ impl Queue{
                     if let Some(buf) = frame_buffer.get_mut(&buf_idx) {
                         let buf = &buf.as_ref()[offset as usize..];
                         let mut buf: [u8;PAYLOAD_SIZE as usize] = buf.try_into().unwrap();
-                        if let Some(list) = handler.handle_packet(&mut buf, ifidx, queue_id){
+                        if let Some(list) = handler.handle_packet(&mut buf, ifidx, queue_id).await{
                             for (ifidx, queue_id) in list{
                                 send_map.get_mut(&(ifidx, queue_id)).unwrap().push_back(desc);
                             }
@@ -502,12 +518,12 @@ fn send(descriptors: &mut VecDeque<XdpDesc>, failed: &mut VecDeque<XdpDesc>, rin
     Ok(sent)
 }
 
-fn complete(fq_cq: &mut std::sync::MutexGuard<'_, DeviceQueue>, total_queues: u32, complete_address_list: &mut HashMap<u64, Arc<Mutex<VecDeque<u64>>>>) -> anyhow::Result<u32>{
+fn complete(fq_cq: &mut RwLockWriteGuard<'_, MyDeviceQueue>, total_queues: u32, complete_address_list: &mut HashMap<u64, Arc<Mutex<VecDeque<u64>>>>) -> anyhow::Result<u32>{
     //let mut fq_cq = fq_cq.write().await;
     let mut completed = 0;
-    let available = fq_cq.available();
+    let available = fq_cq.0.available();
     
-    let mut reader = fq_cq.complete(available);
+    let mut reader = fq_cq.0.complete(available);
     
     while let Some(addr) = reader.read(){
         let addr = addr - HEADROOM as u64;
@@ -522,8 +538,8 @@ fn complete(fq_cq: &mut std::sync::MutexGuard<'_, DeviceQueue>, total_queues: u3
     Ok(completed)
 }
 
-fn fill(fq_cq: &mut std::sync::MutexGuard<'_, DeviceQueue>, desc_list: &mut VecDeque<u64>, failed: &mut VecDeque<u64>) -> anyhow::Result<u32>{
-    let mut writer = fq_cq.fill(desc_list.len() as u32);
+fn fill(fq_cq: &mut RwLockWriteGuard<'_, MyDeviceQueue>, desc_list: &mut VecDeque<u64>, failed: &mut VecDeque<u64>) -> anyhow::Result<u32>{
+    let mut writer = fq_cq.0.fill(desc_list.len() as u32);
     let mut filled = 0;
     while let Some(addr) = desc_list.pop_front(){
         if writer.insert_once(addr){
@@ -537,12 +553,12 @@ fn fill(fq_cq: &mut std::sync::MutexGuard<'_, DeviceQueue>, desc_list: &mut VecD
     Ok(filled)
 }
 
-fn pending(fq_cq: &mut std::sync::MutexGuard<'_, DeviceQueue>) -> anyhow::Result<u32>{
-    let pending = fq_cq.pending();
+fn pending(fq_cq: &mut RwLockWriteGuard<'_, MyDeviceQueue>) -> anyhow::Result<u32>{
+    let pending = fq_cq.0.pending();
     Ok(pending)
 }
 
-
+#[async_trait]
 pub trait PacketHandler: Send + Sync + Clone{
-    fn handle_packet(&mut self, buf: &mut [u8], ifidx: u32, queue_id: u32) -> Option<Vec<(u32, u32)>>;
+    async fn handle_packet(&mut self, buf: &mut [u8], ifidx: u32, queue_id: u32) -> Option<Vec<(u32, u32)>>;
 }
