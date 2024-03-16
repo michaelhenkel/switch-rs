@@ -390,8 +390,7 @@ impl Queue{
                     let offset = desc.addr - buf_idx;
 
                     if let Some(buf) = frame_buffer.get_mut(&buf_idx) {
-                        let buf = &buf.as_ref()[offset as usize..];
-                        let mut buf: [u8;PAYLOAD_SIZE as usize] = buf.try_into().unwrap();
+                        let mut buf = &mut buf.as_mut()[offset as usize..];
                         if let Some(list) = handler.handle_packet(&mut buf, ifidx, queue_id).await{
                             for (ifidx, queue_id) in list{
                                 send_map.get_mut(&(ifidx, queue_id)).unwrap().push_back(desc);

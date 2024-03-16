@@ -1,7 +1,7 @@
-use std::{collections::HashMap, hash::Hash, net::{IpAddr, Ipv4Addr}, sync::{Arc, Mutex}};
+use std::{collections::HashMap, hash::Hash, net::{IpAddr, Ipv4Addr}, sync::{Arc, Mutex}, vec};
 use async_trait::async_trait;
 use log::{error, info};
-use pnet::{ipnetwork::IpNetwork, packet::{arp::{self, ArpOperations, ArpPacket, MutableArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, ip::{IpNextHeaderProtocol, IpNextHeaderProtocols}, ipv4::Ipv4Packet, Packet}};
+use pnet::{ipnetwork::IpNetwork, packet::{arp::{self, ArpOperations, ArpPacket, MutableArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, icmp::{IcmpTypes, MutableIcmpPacket}, ip::{IpNextHeaderProtocol, IpNextHeaderProtocols}, ipv4::{Ipv4Packet, MutableIpv4Packet}, Packet}};
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use switch_rs_common::{FlowKey, FlowNextHop};
 use crate::{af_xdp::{af_xdp::PacketHandler, interface::interface::Interface}, network_state::network_state::NetworkStateClient};
@@ -31,12 +31,10 @@ impl PacketHandler for Handler {
         if let Some(mut eth_packet) = MutableEthernetPacket::new(buf){
             match eth_packet.get_ethertype(){
                 EtherTypes::Arp => {
-                    info!("ARP packet");
                     return self.arp_handler(&mut eth_packet, ifidx, queue_id).await;
                 },
                 EtherTypes::Ipv4 => {
-                    info!("IPv4 packet");
-                    return self.ipv4_handler(eth_packet, queue_id, ifidx);
+                    return self.ipv4_handler(&mut eth_packet, queue_id, ifidx).await;
                 },
                 _ => {
                     error!("ethertype not supported");
@@ -96,29 +94,26 @@ impl Handler {
 
                 let mut ifidx_queue_id_list = Vec::new();
                 let target_ip = arp_packet.get_target_proto_addr();
+                let sender_ip = arp_packet.get_sender_proto_addr();
 
                 // check if oif for target_ip is known
-                info!("trying to get ifdx from ip: {:?}", target_ip);
                 if let Some(dest_ifdx) = self.network_state_client.get_ifdx_from_ip(u32::from_be_bytes(target_ip.octets())).await{
-                    info!("dest_ifdx: {:?}", dest_ifdx);
                     ifidx_queue_id_list.push((dest_ifdx, queue_id));
                     return Some(ifidx_queue_id_list);
                 }
 
                 // check if target_ip is for us
-                info!("checking if target_ip {:#?} is for us", target_ip);
                 if let Some(bridge_id) = self.network_state_client.get_bridge_from_ip(u32::from_be_bytes(target_ip.octets())).await{
-                    info!("for us");
                     arp_packet.set_operation(ArpOperations::Reply);
                     arp_packet.set_sender_hw_addr(bridge_id.into());
                     arp_packet.set_sender_proto_addr(target_ip);
+                    arp_packet.set_target_proto_addr(sender_ip);
+                    arp_packet.set_target_hw_addr(src_mac);
                     eth_packet.set_destination(eth_packet.get_source());
                     eth_packet.set_source(bridge_id.into());
-                    //info!("eth_packet: {:#?}", eth_packet.packet());
                     ifidx_queue_id_list.push((ifidx, queue_id));
                     return Some(ifidx_queue_id_list);
                 }
-                info!("{:?} not for us", target_ip);
 
                 for (_, interface) in &self.interface_list{
                     if interface.ifidx == ifidx{
@@ -136,7 +131,6 @@ impl Handler {
                         return Some(ifidx_queue_id_list);
                     }
                 }
-                info!("target_ip: {:?}", target_ip);
                 let bridge_id = get_interface_by_index(ifidx);
                 for (_, interface) in &self.interface_list{
                     if interface.ifidx == ifidx{
@@ -153,11 +147,12 @@ impl Handler {
             },
             _ => {},
         }
-        error!("ARP operation not supported");
         None
     }
-    fn ipv4_handler(&mut self, eth_packet: MutableEthernetPacket<'_>, queue_id: u32, ifidx: u32) -> Option<Vec<(u32, u32)>>{
-        let ip_packet = Ipv4Packet::new(eth_packet.payload()).unwrap();
+    async fn ipv4_handler(&mut self, eth_packet: &mut MutableEthernetPacket<'_>, queue_id: u32, ifidx: u32) -> Option<Vec<(u32, u32)>>{
+        let dst_mac: [u8;6] = eth_packet.get_destination().into();
+        let mut ip_packet = MutableIpv4Packet::new(eth_packet.payload_mut()).unwrap();
+        let dst_ip = ip_packet.get_destination();
         let src_dst_port = match ip_packet.get_next_level_protocol(){
             IpNextHeaderProtocols::Tcp => {
                 let tcp_packet = pnet::packet::tcp::TcpPacket::new(ip_packet.payload()).unwrap();
@@ -168,6 +163,17 @@ impl Handler {
                 Some((udp_packet.get_source(), udp_packet.get_destination()))
             },
             IpNextHeaderProtocols::Icmp => {
+
+                if let Some(bridge_id) = self.network_state_client.get_bridge_from_ip(u32::from_be_bytes(dst_ip.octets())).await{
+                    let mut icmp_packet = MutableIcmpPacket::new(ip_packet.payload_mut()).unwrap();
+                    icmp_packet.set_icmp_type(IcmpTypes::EchoReply);
+                    icmp_packet.set_checksum(pnet::packet::icmp::checksum(&icmp_packet.to_immutable()));
+                    ip_packet.set_destination(ip_packet.get_source());
+                    ip_packet.set_source(dst_ip);
+                    eth_packet.set_destination(eth_packet.get_source());
+                    eth_packet.set_source(bridge_id.into());
+                    return Some(vec![(ifidx, queue_id)]);
+                }
                 Some((0, 0))
             },
             _ => {
@@ -184,10 +190,9 @@ impl Handler {
             if let Ok(flow_next_hop) = self.global_flow_table.lock().unwrap().get(&flow_key, 0){
                 return Some(vec![(flow_next_hop.ifidx, flow_next_hop.queue_id)]);
             }
-
         }
         
-        let dst_mac: [u8;6] = eth_packet.get_destination().into();
+        
         let mut ret = None;
         if let Some(dst_ifidx) = self.local_mac_table.get(&dst_mac){
             ret = Some(vec![(*dst_ifidx, queue_id)]);
@@ -217,49 +222,45 @@ impl Handler {
             return ret
         }
 
-        //let oif_list = route_lookup(u32::from_be_bytes(ip_packet.get_destination().octets()));
-        //info!("oif_list: {:?}", oif_list);
+        let vrf = if let Some(vrf) = self.network_state_client.get_vrf_from_ifidx(ifidx).await{
+            Some(vrf)
+        } else if let Some(intf) = self.network_state_client.get_interface(ifidx).await{
+            if let Some(bridge_id) = intf.bridge_id{
+                if let Some(bridge) = self.network_state_client.get_bridge(bridge_id).await{
+                    bridge.vrf
+                } else { None }
+            } else { None }
+        } else { None };
 
-        let mut ifidx_queue_id_list = Vec::new();
-        for (_, interface) in &self.interface_list{
-            if interface.ifidx == ifidx{
-                continue;
+
+
+        if let Some(vrf) = vrf{
+            info!("vrf: {:?}", vrf);
+            let routes = self.network_state_client.get_routes(u32::from_be_bytes(dst_ip.octets()), vrf).await;
+            info!("routes: {:?} for {} {:?}", routes, vrf, dst_ip);
+            for (gateway_ip, oif_idx, mac) in routes{
+                info!("gateway_ip: {:?}, oif_idx: {:?}, mac: {:?}", gateway_ip, oif_idx, mac);
+                if let Some(gateway_mac) = self.network_state_client.get_gateway_mac_from_prefix(gateway_ip).await{
+                    info!("gateway_mac: {:?}", gateway_mac);
+                    eth_packet.set_destination(gateway_mac.into());
+                    eth_packet.set_source(mac.into());
+                    return Some(vec![(oif_idx, queue_id)]);
+                }
             }
-            ifidx_queue_id_list.push((interface.ifidx, queue_id));
-        }
-        self.local_mac_table.insert(eth_packet.get_source().into(), ifidx);
-        return Some(ifidx_queue_id_list);
-    }
-}
 
-fn route_lookup(prefix: u32) -> Vec<u32>{
-    let rt = Runtime::new().unwrap();
-    
-    let _guard = rt.enter();
-    let (connection, handle, _) = new_connection().unwrap();
-    let ret = tokio::spawn(async move {
-        tokio::spawn(connection);
-        let mut oif_list = Vec::new();
-        let mut routes = handle.route().get(IpVersion::V4).execute();
-        while let Some(route_message) = routes.try_next().await.unwrap() {
-            let destination_prefix_len = route_message.header.destination_prefix_length;
-            for attr in &route_message.attributes {
-                if let RouteAttribute::Destination(route_address) = attr{
-                    if let RouteAddress::Inet(address) = route_address {
-                        let ip_net = ipnet::IpNet::new(IpAddr::V4(*address), destination_prefix_len).unwrap();
-                        let prefix = Ipv4Addr::from(prefix);
-                        if ip_net.contains(&IpAddr::V4(prefix)){
-                            for attr in &route_message.attributes {
-                                match attr{
-                                    RouteAttribute::Oif(oif) => {
-                                        oif_list.push(*oif);
-                                    },
-                                    RouteAttribute::MultiPath(route_next_hop_list) => {
-                                        for route_next_hop in route_next_hop_list{
-                                            oif_list.push(route_next_hop.interface_index);
-                                        }
-                                    }
-                                    _ => {}
+            let bridges = self.network_state_client.get_bridges_from_vrf(vrf).await;
+            for bridge in &bridges{
+                for (prefix, prefix_len) in &bridge.ips{
+                    let net = IpNetwork::new(IpAddr::V4(Ipv4Addr::from(*prefix)), *prefix_len).unwrap();
+                    if net.contains(IpAddr::V4(Ipv4Addr::from(dst_ip))){
+                        info!("found bridge {:?} for dst_ip: {:?}",bridge, dst_ip);
+                        for interface in &bridge.interfaces{
+                            if let Some(interface) = self.network_state_client.get_interface(*interface).await{
+                                if let Some(dst_mac) = self.network_state_client.send_arp_request(u32::from_be_bytes(dst_ip.octets()), interface.clone()).await{
+                                    info!("dst_mac: {:?}", dst_mac);
+                                    eth_packet.set_destination(dst_mac.into());
+                                    eth_packet.set_source(interface.mac.into());
+                                    return Some(vec![(interface.idx, queue_id)]);
                                 }
                             }
                         }
@@ -267,11 +268,9 @@ fn route_lookup(prefix: u32) -> Vec<u32>{
                 }
             }
         }
-        println!("oif_list: {:?}", oif_list);
-        oif_list
-    });
-    let mut oif_list = Vec::new();
-    oif_list
+        error!("no forwarind information found for dst_ip: {:?}", dst_ip);
+        None
+    }
 }
 
 fn interface_ips(idx: u32) -> Vec<u32>{

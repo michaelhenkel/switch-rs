@@ -64,6 +64,15 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
     let eth_hdr = ptr_at_mut::<EthHdr>(&ctx, 0).ok_or(xdp_action::XDP_ABORTED)?;
     //info!(&ctx, "interface {}/{} received packet", ingress_if_idx, queue);
     if unsafe { (*eth_hdr).ether_type } == EtherType::Arp {
+
+        let smac = unsafe { (*eth_hdr).src_addr };
+        unsafe { MACTABLE.insert(&smac, &ingress_if_idx, 0).map_err(|_| {
+            info!(&ctx,"failed to insert MAC address into MACTABLE");
+            xdp_action::XDP_ABORTED
+        })? };
+        return Ok(xdp_action::XDP_PASS);
+
+        /*
         let arp_hdr = match ptr_at::<ArpHdr>(&ctx, EthHdr::LEN){
             Some(arp_hdr) => arp_hdr,
             None => {
@@ -119,6 +128,7 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                 return Ok(xdp_action::XDP_PASS);
             }
         }
+        */
     }
 
     if unsafe { (*eth_hdr).ether_type } == EtherType::Ipv4 {
