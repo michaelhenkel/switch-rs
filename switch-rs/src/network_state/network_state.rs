@@ -3,7 +3,7 @@ use std::{collections::{HashMap, HashSet}, net::{IpAddr, Ipv4Addr}, sync::Arc};
 use futures::{TryStreamExt, TryStream};
 use log::{info, error};
 use netlink_packet_route::{address, link::{InfoBridgePort, InfoPortData, InfoPortKind, LinkAttribute, LinkInfo}, route::{RouteAddress, RouteAttribute}, AddressFamily};
-use pnet::{datalink::{self, Channel, NetworkInterface}, packet::{arp::{ArpHardwareTypes, ArpOperation, ArpOperations, ArpPacket, MutableArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, Packet}, util::MacAddr};
+use pnet::{datalink::{self, Channel, Config, NetworkInterface}, packet::{arp::{ArpHardwareTypes, ArpOperation, ArpOperations, ArpPacket, MutableArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, Packet}, util::MacAddr};
 use rtnetlink::{new_connection, IpVersion};
 use tokio::sync::RwLock;
 use pnet::packet::MutablePacket;
@@ -31,6 +31,7 @@ pub struct NetlinkBridge{
     pub idx: u32,
     pub interfaces: HashSet<u32>,
     pub vrf: Option<u32>,
+    pub mac: [u8;6],
 }
 
 #[derive(Debug, Default, Clone)]
@@ -98,6 +99,7 @@ impl NetworkState{
                     bridge.ips = addresses;
                     bridge.idx = bridge_idx;
                     bridge.vrf = vrf;
+                    bridge.mac = bridge_id;
                     if let Some(vrf) = vrf{
                         self.state.ifidx_to_vrf.insert(bridge_idx, vrf);
                     }
@@ -117,9 +119,12 @@ impl NetworkState{
         self.print_route_table();
 
         for (interface, prefix) in oif_gateway{
-            if let Some(mac) = self.send_arp_request(prefix, interface).await{
-                self.state.gateway_mac_table.insert(prefix, mac);
-            };
+            for (ip, _) in &interface.ips{
+                if let Some(mac) = self.send_arp_request(prefix, interface.mac, *ip, interface.idx).await{
+                    self.state.gateway_mac_table.insert(prefix, mac);
+                };
+            }
+
         }
 
         let mut rx = self.rx.write().await;
@@ -158,8 +163,8 @@ impl NetworkState{
                     let bridges: Vec<NetlinkBridge> = self.state.bridges.values().filter(|bridge| bridge.vrf == Some(vrf)).cloned().collect();
                     tx.send(bridges).unwrap();
                 },
-                NetworkStateCommand::SendArpRequest { prefix, interface, tx } => {
-                    let mac = self.send_arp_request(prefix, interface).await;
+                NetworkStateCommand::SendArpRequest { prefix, src_mac, src_ip, dst_ifidx, tx } => {
+                    let mac = self.send_arp_request(prefix, src_mac, src_ip, dst_ifidx).await;
                     tx.send(mac).unwrap();
                 },
 
@@ -303,20 +308,16 @@ impl NetworkState{
             }
         }
     }
-    async fn send_arp_request(&self, prefix: u32, interface: NetlinkInterface) -> Option<[u8;6]>{
-        if interface.ips.is_empty(){
-            return None;
-        }
+    async fn send_arp_request(&self, prefix: u32, src_mac: [u8;6], src_ip: u32, dst_ifidx: u32) -> Option<[u8;6]>{
         let interfaces = datalink::interfaces();
-        let interfaces_name_match = |iface: &NetworkInterface| iface.index == interface.idx;
+        let interfaces_name_match = |iface: &NetworkInterface| iface.index == dst_ifidx;
         let network_interface = interfaces.into_iter().filter(interfaces_name_match).next().unwrap();
     
-        let (source_ip, _) = interface.ips[0];
         let mut ethernet_buffer = [0u8; 42];
         let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
     
         ethernet_packet.set_destination(MacAddr::broadcast());
-        ethernet_packet.set_source(interface.mac.into());
+        ethernet_packet.set_source(src_mac.into());
         ethernet_packet.set_ethertype(EtherTypes::Arp);
     
         let mut arp_buffer = [0u8; 28];
@@ -327,31 +328,37 @@ impl NetworkState{
         arp_packet.set_hw_addr_len(6);
         arp_packet.set_proto_addr_len(4);
         arp_packet.set_operation(ArpOperations::Request);
-        arp_packet.set_sender_hw_addr(interface.mac.into());
-        arp_packet.set_sender_proto_addr(Ipv4Addr::from(source_ip));
+        arp_packet.set_sender_hw_addr(src_mac.into());
+        arp_packet.set_sender_proto_addr(Ipv4Addr::from(src_ip));
         arp_packet.set_target_hw_addr(MacAddr::broadcast());
         arp_packet.set_target_proto_addr(Ipv4Addr::from(prefix));
         ethernet_packet.set_payload(arp_packet.packet_mut());
     
-        let (mut tx, mut rx) = match datalink::channel(&network_interface, Default::default()) {
+        let mut configuration = Config::default();
+        configuration.read_timeout = Some(std::time::Duration::from_secs(2));
+        let (mut tx, mut rx) = match datalink::channel(&network_interface, configuration) {
             Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
             Ok(_) => panic!("Unknown channel type"),
             Err(e) => panic!("Error happened {}", e),
         };
     
-        tx.send_to(&ethernet_packet.to_immutable().packet(), Some(network_interface));
-        let timeout = tokio::time::Instant::now();
+
+        tx.send_to(&ethernet_packet.to_immutable().packet(), Some(network_interface.clone()));
         loop {
-            let buf = rx.next().unwrap();
+            info!("Waiting for arp response");
+            let buf = match rx.next(){
+                Ok(buf) => buf,
+                Err(e) => {
+                    error!("Error getting arp response: {}\n{:#?}\n{:#?}\n{:#?}", e, network_interface, ethernet_packet, arp_packet);
+                    return None;
+                }
+            };
+            info!("Got arp response");
             let arp = ArpPacket::new(&buf[MutableEthernetPacket::minimum_packet_size()..]).unwrap();
             if arp.get_sender_proto_addr() == Ipv4Addr::from(prefix)
-                && arp.get_target_hw_addr() == Into::<MacAddr>::into(interface.mac)
+                && arp.get_target_hw_addr() == Into::<MacAddr>::into(src_mac)
             {
                 return Some(arp.get_sender_hw_addr().into());
-            }
-            if timeout.elapsed().as_secs() > 1{
-                error!("ARP request timeout for arp_packet: {:?}", arp);
-                return None;
             }
         }
     }
@@ -425,10 +432,10 @@ impl NetworkStateClient{
         local_tx.send(NetworkStateCommand::GetBridgesFromVrf{vrf, tx}).await.unwrap();
         rx.await.unwrap()
     }
-    pub async fn send_arp_request(&self, prefix: u32, interface: NetlinkInterface) -> Option<[u8;6]>{
+    pub async fn send_arp_request(&self, prefix: u32, src_mac: [u8;6], src_ip: u32, dst_ifidx: u32) -> Option<[u8;6]>{
         let local_tx = self.tx.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        local_tx.send(NetworkStateCommand::SendArpRequest{prefix, interface, tx}).await.unwrap();
+        local_tx.send(NetworkStateCommand::SendArpRequest{prefix, src_mac, src_ip, dst_ifidx, tx}).await.unwrap();
         rx.await.unwrap()
     }
 }
@@ -469,7 +476,9 @@ pub enum NetworkStateCommand{
     },
     SendArpRequest{
         prefix: u32,
-        interface: NetlinkInterface,
+        src_mac: [u8;6],
+        src_ip: u32,
+        dst_ifidx: u32,
         tx: tokio::sync::oneshot::Sender<Option<[u8;6]>>,
     },
 }

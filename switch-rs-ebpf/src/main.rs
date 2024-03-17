@@ -179,6 +179,32 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
             };
 
             if let Some(flow_next_hop) = unsafe { FLOWTABLE.get(&flow_key) }{
+                //info!(&ctx,"flow found in FLOWTABLE");                
+                for i in 0..6{
+                    unsafe { (*eth_hdr).src_addr[i] = flow_next_hop.src_mac[i] };
+                    unsafe { (*eth_hdr).dst_addr[i] = flow_next_hop.dst_mac[i] };
+                }
+                //unsafe { (*flow_next_hop).packet_count += 1 };
+                //let next_hop_ifidx = unsafe { (*flow_next_hop).ifidx };
+                /*
+                info!(&ctx,"src_mac: {:x}:{:x}:{:x}:{:x}:{:x}:{:x}", 
+                    unsafe { (*eth_hdr).src_addr[0] },
+                    unsafe { (*eth_hdr).src_addr[1] },
+                    unsafe { (*eth_hdr).src_addr[2] },
+                    unsafe { (*eth_hdr).src_addr[3] },
+                    unsafe { (*eth_hdr).src_addr[4] },
+                    unsafe { (*eth_hdr).src_addr[5] },
+                );
+                info!(&ctx,"dst_mac: {:x}:{:x}:{:x}:{:x}:{:x}:{:x}", 
+                    unsafe { (*eth_hdr).dst_addr[0] },
+                    unsafe { (*eth_hdr).dst_addr[1] },
+                    unsafe { (*eth_hdr).dst_addr[2] },
+                    unsafe { (*eth_hdr).dst_addr[3] },
+                    unsafe { (*eth_hdr).dst_addr[4] },
+                    unsafe { (*eth_hdr).dst_addr[5] },
+                );
+                info!(&ctx,"redirecting packet to interface {}/{}", flow_next_hop.ifidx, flow_next_hop.queue_id);
+                */
                 let res = unsafe { bpf_redirect(flow_next_hop.ifidx, 0)};
                 return Ok(res as u32)
             }

@@ -150,9 +150,12 @@ impl Handler {
         None
     }
     async fn ipv4_handler(&mut self, eth_packet: &mut MutableEthernetPacket<'_>, queue_id: u32, ifidx: u32) -> Option<Vec<(u32, u32)>>{
+        info!("IPv4 packet");
         let dst_mac: [u8;6] = eth_packet.get_destination().into();
+        let src_mac: [u8;6] = eth_packet.get_source().into();
         let mut ip_packet = MutableIpv4Packet::new(eth_packet.payload_mut()).unwrap();
         let dst_ip = ip_packet.get_destination();
+        let src_ip = ip_packet.get_source();
         let src_dst_port = match ip_packet.get_next_level_protocol(){
             IpNextHeaderProtocols::Tcp => {
                 let tcp_packet = pnet::packet::tcp::TcpPacket::new(ip_packet.payload()).unwrap();
@@ -188,17 +191,21 @@ impl Handler {
                 dst_port,
             };
             if let Ok(flow_next_hop) = self.global_flow_table.lock().unwrap().get(&flow_key, 0){
+                info!("found flow_next_hop: {:?}", flow_next_hop);
                 return Some(vec![(flow_next_hop.ifidx, flow_next_hop.queue_id)]);
+            } else {
+                info!("flow_next_hop not found");
             }
         }
         
         
         let mut ret = None;
         if let Some(dst_ifidx) = self.local_mac_table.get(&dst_mac){
+            info!("found dst_ififx {} in local_mac_table", dst_ifidx);
             ret = Some(vec![(*dst_ifidx, queue_id)]);
-            
         } else {
             if let Ok(dst_ifidx) = self.global_mac_table.lock().unwrap().get(&dst_mac.into(),0){
+                info!("found dst_ififx {} in global_mac_table", dst_ifidx);
                 self.local_mac_table.insert(dst_mac, dst_ifidx);
                 ret = Some(vec![(dst_ifidx, queue_id)]);
             }
@@ -206,18 +213,39 @@ impl Handler {
 
         if ret.is_some(){
             if let Some((src_port, dst_port)) = src_dst_port{
-                let flow_key = FlowKey{
-                    src_ip: u32::from_be_bytes(ip_packet.get_source().octets()),
-                    dst_ip: u32::from_be_bytes(ip_packet.get_destination().octets()),
+                let fwd_flow_key = FlowKey{
+                    src_ip: u32::from_be_bytes(src_ip.octets()),
+                    dst_ip: u32::from_be_bytes(dst_ip.octets()),
                     src_port,
                     dst_port,
                 };
-                let flow_next_hop = FlowNextHop{
+                let fwd_flow_next_hop = FlowNextHop{
                     ifidx: ret.as_ref().unwrap()[0].0,
-                    queue_id: ret.as_ref().unwrap()[0].1,
-                    mac: eth_packet.get_source().into(),
+                    queue_id,
+                    src_mac,
+                    dst_mac,
+                    next_hop_count: 0,
+                    next_hop_idx: 0,
+                    packet_count: 0,
                 };
-                self.global_flow_table.lock().unwrap().insert(&flow_key, &flow_next_hop, 0).unwrap();
+                self.global_flow_table.lock().unwrap().insert(&fwd_flow_key, &fwd_flow_next_hop, 0).unwrap();
+
+                let rev_flow_key = FlowKey{
+                    src_ip: u32::from_be_bytes(dst_ip.octets()),
+                    dst_ip: u32::from_be_bytes(src_ip.octets()),
+                    src_port: dst_port,
+                    dst_port: src_port,
+                };
+                let rev_flow_next_hop = FlowNextHop{
+                    ifidx,
+                    queue_id,
+                    src_mac: dst_mac,
+                    dst_mac: src_mac,
+                    next_hop_count: 0,
+                    next_hop_idx: 0,
+                    packet_count: 0,
+                };
+                self.global_flow_table.lock().unwrap().insert(&rev_flow_key, &rev_flow_next_hop, 0).unwrap();
             }
             return ret
         }
@@ -231,9 +259,6 @@ impl Handler {
                 } else { None }
             } else { None }
         } else { None };
-
-
-
         if let Some(vrf) = vrf{
             info!("vrf: {:?}", vrf);
             let routes = self.network_state_client.get_routes(u32::from_be_bytes(dst_ip.octets()), vrf).await;
@@ -244,24 +269,59 @@ impl Handler {
                     info!("gateway_mac: {:?}", gateway_mac);
                     eth_packet.set_destination(gateway_mac.into());
                     eth_packet.set_source(mac.into());
+                    if let Some((src_port, dst_port)) = src_dst_port{
+                        let fwd_flow_key = FlowKey{
+                            src_ip: u32::from_be_bytes(src_ip.octets()),
+                            dst_ip: u32::from_be_bytes(dst_ip.octets()),
+                            src_port,
+                            dst_port,
+                        };
+                        let fwd_flow_next_hop = FlowNextHop{
+                            ifidx: oif_idx,
+                            queue_id,
+                            src_mac,
+                            dst_mac,
+                            next_hop_count: 0,
+                            next_hop_idx: 0,
+                            packet_count: 0,
+                        };
+                        self.global_flow_table.lock().unwrap().insert(&fwd_flow_key, &fwd_flow_next_hop, 0).unwrap();
+        
+                        let rev_flow_key = FlowKey{
+                            src_ip: u32::from_be_bytes(dst_ip.octets()),
+                            dst_ip: u32::from_be_bytes(src_ip.octets()),
+                            src_port: dst_port,
+                            dst_port: src_port,
+                        };
+                        let rev_flow_next_hop = FlowNextHop{
+                            ifidx,
+                            queue_id,
+                            src_mac: dst_mac,
+                            dst_mac: src_mac,
+                            next_hop_count: 0,
+                            next_hop_idx: 0,
+                            packet_count: 0,
+                        };
+                        self.global_flow_table.lock().unwrap().insert(&rev_flow_key, &rev_flow_next_hop, 0).unwrap();
+                    }
                     return Some(vec![(oif_idx, queue_id)]);
                 }
             }
-
             let bridges = self.network_state_client.get_bridges_from_vrf(vrf).await;
             for bridge in &bridges{
                 for (prefix, prefix_len) in &bridge.ips{
                     let net = IpNetwork::new(IpAddr::V4(Ipv4Addr::from(*prefix)), *prefix_len).unwrap();
                     if net.contains(IpAddr::V4(Ipv4Addr::from(dst_ip))){
-                        info!("found bridge {:?} for dst_ip: {:?}",bridge, dst_ip);
+                        info!("found bridge {:?} for dst_ip: {:?} with interfaces: {:?}",bridge, dst_ip, bridge.interfaces);
                         for interface in &bridge.interfaces{
-                            if let Some(interface) = self.network_state_client.get_interface(*interface).await{
-                                if let Some(dst_mac) = self.network_state_client.send_arp_request(u32::from_be_bytes(dst_ip.octets()), interface.clone()).await{
-                                    info!("dst_mac: {:?}", dst_mac);
-                                    eth_packet.set_destination(dst_mac.into());
-                                    eth_packet.set_source(interface.mac.into());
-                                    return Some(vec![(interface.idx, queue_id)]);
-                                }
+                            info!("intf: {:?}", interface);
+                            if let Some(dst_mac) = self.network_state_client.send_arp_request(u32::from_be_bytes(dst_ip.octets()), bridge.mac, *prefix, *interface).await{
+                                info!("dst_mac: {:?}", dst_mac);
+                                eth_packet.set_destination(dst_mac.into());
+                                eth_packet.set_source(bridge.mac.into());
+                                return Some(vec![(*interface, queue_id)]);
+                            } else {
+                                error!("dst_mac not found from arp request");
                             }
                         }
                     }

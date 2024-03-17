@@ -64,7 +64,11 @@ unsafe impl aya::Pod for FlowKey {}
 pub struct FlowNextHop{
     pub ifidx: u32,
     pub queue_id: u32,
-    pub mac: [u8;6],
+    pub src_mac: [u8;6],
+    pub dst_mac: [u8;6],
+    pub next_hop_count: u32,
+    pub next_hop_idx: u32,
+    pub packet_count: u32,
 }
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FlowNextHop {}
