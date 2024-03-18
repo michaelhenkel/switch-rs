@@ -9,11 +9,10 @@ use clap::Parser;
 use env_logger::fmt;
 use log::{debug, info, warn};
 use tokio::signal;
-use switch_rs_common::{FlowKey, FlowNextHop, InterfaceConfig, InterfaceQueue};
+use switch_rs_common::{ArpEntry, FlowKey, FlowNextHop, InterfaceConfig, InterfaceConfiguration, InterfaceQueue};
 use af_xdp::{
     interface::interface::{get_interface_index, get_interface_mac},
     af_xdp::AfXdp,
-    af_xdp::PacketHandler,
 };
 use crate::af_xdp::interface::interface::Interface;
 use crate::network_state::network_state::NetworkState;
@@ -128,10 +127,26 @@ async fn main() -> Result<(), anyhow::Error> {
         panic!("FLOWTABLE map not found");
     };
 
+    let arp_table = if let Some(arp_table) = bpf.take_map("ARPTABLE"){
+        let arp_table: BpfHashMap<MapData, u32, ArpEntry> = BpfHashMap::try_from(arp_table).unwrap();
+        arp_table
+    } else {
+        panic!("ARPTABLE map not found");
+    };
+
+    let interface_configuration = if let Some(interface_configuration) = bpf.take_map("INTERFACECONFIGURATION"){
+        let interface_configuration: BpfHashMap<MapData, u32, InterfaceConfiguration> = BpfHashMap::try_from(interface_configuration).unwrap();
+        interface_configuration
+    } else {
+        panic!("INTERFACECONFIGURATION map not found");
+    };
+
     let mac_table_mutex = Arc::new(Mutex::new(mac_table));
     let flow_table_mutex = Arc::new(Mutex::new(flow_table));
-    let mut network_state = NetworkState::new(interface_list.clone());
-    let handler = handler::handler::Handler::new(interface_list.clone(), mac_table_mutex, flow_table_mutex, network_state.client());
+    let arp_table_mutex = Arc::new(Mutex::new(arp_table));
+    let interface_configuration_mutex = Arc::new(Mutex::new(interface_configuration));
+    let mut network_state = NetworkState::new(interface_list.clone(), interface_configuration_mutex);
+    let handler = handler::handler::Handler::new(interface_list.clone(), mac_table_mutex, flow_table_mutex, arp_table_mutex, network_state.client());
     let afxdp = AfXdp::new(interface_list.clone(), xsk_map, interface_queue_table);
     let mut jh_list = Vec::new();
     let handler_clone = handler.clone();
@@ -141,10 +156,7 @@ async fn main() -> Result<(), anyhow::Error> {
     });
     jh_list.push(jh);
 
-    let jh = tokio::spawn(async move {
-        handler.run().await.unwrap();
-    });
-    jh_list.push(jh);
+
     let jh = tokio::spawn(async move {
         afxdp.run(handler_clone).await.unwrap();
     });

@@ -72,3 +72,24 @@ pub struct FlowNextHop{
 }
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FlowNextHop {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ArpEntry{
+    pub ifidx: u32,
+    pub smac: [u8;6],
+    pub pad: u16,
+}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ArpEntry {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InterfaceConfiguration{
+    pub vrf: u32,
+    pub bridge_id: [u8;6],
+    pub l2: u8,
+    pub pad: u8,
+}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for InterfaceConfiguration {}

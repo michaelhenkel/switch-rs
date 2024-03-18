@@ -2,7 +2,7 @@ use core::{num::NonZeroU32, ptr::NonNull};
 use std::{cell::UnsafeCell, collections::{HashMap, VecDeque},sync::{Arc, Mutex}, time::Duration};
 use anyhow::anyhow;
 use async_trait::async_trait;
-use switch_rs_common::{FlowKey, FlowNextHop, InterfaceQueue};
+use switch_rs_common::InterfaceQueue;
 use tokio::sync::{RwLock, RwLockWriteGuard};
 use xdpilone::{xdp::XdpDesc, DeviceQueue, RingRx, RingTx};
 use aya::maps::{HashMap as BpfHashMap, MapData, XskMap};
@@ -14,7 +14,7 @@ use super::interface::interface::Interface;
 const BATCH_SIZE: u32 = 64;
 const FRAME_SIZE: u32 = 1 << 12;
 const HEADROOM: u32 = 1 << 8;
-const PAYLOAD_SIZE: u32 = FRAME_SIZE - HEADROOM;
+//const PAYLOAD_SIZE: u32 = FRAME_SIZE - HEADROOM;
 const BUFFER_SIZE: u32 = 1 << 24;
 const THRESOLD_FACTOR: u32 = 8;
 const RX_INTERVAL: u64 = 50;
@@ -342,7 +342,7 @@ impl Queue{
 
         let jh = tokio::spawn(async move{
             let mut receive_interval = tokio::time::interval(Duration::from_nanos(RX_INTERVAL));
-            let mut pending_now = tokio::time::Instant::now();
+            //let mut pending_now = tokio::time::Instant::now();
             let mut receive_counter = 0;
             let mut total_sent_counter = 0;
             let mut total_receive_counter = 0;

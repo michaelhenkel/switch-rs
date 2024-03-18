@@ -3,7 +3,7 @@
 
 use core::mem;
 use aya_bpf::{
-    bindings::xdp_action::{self, XDP_REDIRECT},
+    bindings::xdp_action,
     helpers::bpf_redirect,
     macros::{map, xdp},
     maps::{HashMap, XskMap},
@@ -18,11 +18,12 @@ use network_types::{
     udp::UdpHdr,
 };
 use switch_rs_common::{
-    ArpHdr,
     InterfaceConfig,
     InterfaceQueue,
     FlowKey,
     FlowNextHop,
+    ArpEntry,
+    InterfaceConfiguration
 };
 
 #[map(name = "INTERFACEMAP")]
@@ -37,12 +38,20 @@ static mut INTERFACECOUNT: HashMap<u32, u32> =
 static mut MACTABLE: HashMap<[u8;6], u32> =
     HashMap::<[u8;6], u32>::with_max_entries(1000, 0);
 
+#[map(name = "ARPTABLE")]
+static mut ARPTABLE: HashMap<u32, ArpEntry> =
+    HashMap::<u32, ArpEntry>::with_max_entries(1000, 0);
+
 #[map(name = "XSKMAP")]
 static mut XSKMAP: XskMap = XskMap::with_max_entries(256, 0);
 
 #[map(name = "INTERFACEQUEUETABLE")]
 static mut INTERFACEQUEUETABLE: HashMap<InterfaceQueue, u32> =
     HashMap::<InterfaceQueue, u32>::with_max_entries(256, 0);
+
+#[map(name = "INTERFACECONFIGURATION")]
+static mut INTERFACECONFIGURATION: HashMap<u32, InterfaceConfiguration> =
+    HashMap::<u32, InterfaceConfiguration>::with_max_entries(256, 0);
 
 #[map(name = "FLOWTABLE")]
 static mut FLOWTABLE: HashMap<FlowKey, FlowNextHop> =
@@ -59,76 +68,39 @@ pub fn switch_rs(ctx: XdpContext) -> u32 {
 fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
     let ingress_if_idx = unsafe { (*ctx.ctx).ingress_ifindex };
     let queue = unsafe { (*ctx.ctx).rx_queue_index };
-    //info!(&ctx,"ingress_if_idx: {}", ingress_if_idx);
-    let length = ctx.data_end() - ctx.data();
     let eth_hdr = ptr_at_mut::<EthHdr>(&ctx, 0).ok_or(xdp_action::XDP_ABORTED)?;
-    //info!(&ctx, "interface {}/{} received packet", ingress_if_idx, queue);
     if unsafe { (*eth_hdr).ether_type } == EtherType::Arp {
-
         let smac = unsafe { (*eth_hdr).src_addr };
-        unsafe { MACTABLE.insert(&smac, &ingress_if_idx, 0).map_err(|_| {
-            info!(&ctx,"failed to insert MAC address into MACTABLE");
-            xdp_action::XDP_ABORTED
-        })? };
-        return Ok(xdp_action::XDP_PASS);
-
-        /*
-        let arp_hdr = match ptr_at::<ArpHdr>(&ctx, EthHdr::LEN){
-            Some(arp_hdr) => arp_hdr,
+        let interface_configuration = match unsafe { INTERFACECONFIGURATION.get(&ingress_if_idx) }{
+            Some(interface_configuration) => interface_configuration,
             None => {
-                info!(&ctx,"failed to get ARP header from packet at offset {}, total len {}", EthHdr::LEN, length);
+                info!(&ctx,"failed to get interface configuration from INTERFACECONFIGURATION");
                 return Ok(xdp_action::XDP_ABORTED);
             }
         };
-        let smac = unsafe { (*arp_hdr).sha };
-        unsafe { MACTABLE.insert(&smac, &ingress_if_idx, 0).map_err(|_| {
-            info!(&ctx,"failed to insert MAC address into MACTABLE");
-            xdp_action::XDP_ABORTED
-        })? };
 
-        let arp_oper = u16::from_be(unsafe { (*arp_hdr).oper });
-        
-        match arp_oper {
-            1 => {
-                
-                
-                let queue_idx = match unsafe { INTERFACEQUEUETABLE.get(&InterfaceQueue::new(ingress_if_idx, queue))}{
-                    Some(queue_idx) => queue_idx,
-                    None => {
-                        info!(&ctx,"failed to get queue index from INTERFACEQUEUETABLE {}/{}", ingress_if_idx, queue);
-                        return Ok(xdp_action::XDP_ABORTED);
-                    }
-                };
-                match unsafe { XSKMAP.redirect(*queue_idx, 0) }{
-                    Ok(res) => {
-                        return Ok(res);
-                    },
-                    Err(e) => {
-                        info!(&ctx,"failed to redirect ARP request to queue {}: {}", queue, e);
-                        return Ok(xdp_action::XDP_ABORTED);
-                    }
-                }
-
-                //return Ok(xdp_action::XDP_PASS);
-            }
-            2 => {
-                let dmac = unsafe { (*arp_hdr).tha };
-                let interface = match unsafe { MACTABLE.get(&dmac) }{
-                    Some(interface) => interface,
-                    None => {
-                        info!(&ctx,"failed to get interface from MACTABLE");
-                        return Ok(xdp_action::XDP_ABORTED);
-                    }
-                };
-                let res = unsafe { bpf_redirect(*interface, 0)};
-                return Ok(res as u32)
-            }
-            _ => {
-                info!(&ctx,"Not an ARP operation {}", unsafe { (*arp_hdr).oper });
-                return Ok(xdp_action::XDP_PASS);
-            }
+        if interface_configuration.l2 == 1 {
+            unsafe { MACTABLE.insert(&smac, &ingress_if_idx, 0).map_err(|_| {
+                info!(&ctx,"failed to insert MAC address into MACTABLE");
+                xdp_action::XDP_ABORTED
+            })? };
+        } else {
+            info!(
+                &ctx,
+                "interface {}/{} is a L3 interface",
+                ingress_if_idx,
+                queue
+            );
+            unsafe { ARPTABLE.insert(&u32::from_be(0), &ArpEntry{
+                ifidx: ingress_if_idx,
+                smac,
+                pad: 0,
+            }, 0).map_err(|_| {
+                info!(&ctx,"failed to insert ARP entry into ARPTABLE");
+                xdp_action::XDP_ABORTED
+            })? };
         }
-        */
+        return Ok(xdp_action::XDP_PASS);
     }
 
     if unsafe { (*eth_hdr).ether_type } == EtherType::Ipv4 {
@@ -178,33 +150,11 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                 dst_port: u16::from_be(dest),
             };
 
-            if let Some(flow_next_hop) = unsafe { FLOWTABLE.get(&flow_key) }{
-                //info!(&ctx,"flow found in FLOWTABLE");                
+            if let Some(flow_next_hop) = unsafe { FLOWTABLE.get(&flow_key) }{            
                 for i in 0..6{
                     unsafe { (*eth_hdr).src_addr[i] = flow_next_hop.src_mac[i] };
                     unsafe { (*eth_hdr).dst_addr[i] = flow_next_hop.dst_mac[i] };
                 }
-                //unsafe { (*flow_next_hop).packet_count += 1 };
-                //let next_hop_ifidx = unsafe { (*flow_next_hop).ifidx };
-                /*
-                info!(&ctx,"src_mac: {:x}:{:x}:{:x}:{:x}:{:x}:{:x}", 
-                    unsafe { (*eth_hdr).src_addr[0] },
-                    unsafe { (*eth_hdr).src_addr[1] },
-                    unsafe { (*eth_hdr).src_addr[2] },
-                    unsafe { (*eth_hdr).src_addr[3] },
-                    unsafe { (*eth_hdr).src_addr[4] },
-                    unsafe { (*eth_hdr).src_addr[5] },
-                );
-                info!(&ctx,"dst_mac: {:x}:{:x}:{:x}:{:x}:{:x}:{:x}", 
-                    unsafe { (*eth_hdr).dst_addr[0] },
-                    unsafe { (*eth_hdr).dst_addr[1] },
-                    unsafe { (*eth_hdr).dst_addr[2] },
-                    unsafe { (*eth_hdr).dst_addr[3] },
-                    unsafe { (*eth_hdr).dst_addr[4] },
-                    unsafe { (*eth_hdr).dst_addr[5] },
-                );
-                info!(&ctx,"redirecting packet to interface {}/{}", flow_next_hop.ifidx, flow_next_hop.queue_id);
-                */
                 let res = unsafe { bpf_redirect(flow_next_hop.ifidx, 0)};
                 return Ok(res as u32)
             }

@@ -1,10 +1,12 @@
-use std::{collections::{HashMap, HashSet}, net::{IpAddr, Ipv4Addr}, sync::Arc};
+use std::{collections::{HashMap, HashSet}, fmt::Display, net::{IpAddr, Ipv4Addr}, sync::{Arc, Mutex}};
 
-use futures::{TryStreamExt, TryStream};
+use aya::maps::{HashMap as BpfHashMap, MapData};
+use futures::TryStreamExt;
 use log::{info, error};
 use netlink_packet_route::{address, link::{InfoBridgePort, InfoPortData, InfoPortKind, LinkAttribute, LinkInfo}, route::{RouteAddress, RouteAttribute}, AddressFamily};
-use pnet::{datalink::{self, Channel, Config, NetworkInterface}, packet::{arp::{ArpHardwareTypes, ArpOperation, ArpOperations, ArpPacket, MutableArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, Packet}, util::MacAddr};
+use pnet::{datalink::{self, Channel, Config, NetworkInterface}, packet::{arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, Packet}, util::MacAddr};
 use rtnetlink::{new_connection, IpVersion};
+use switch_rs_common::InterfaceConfiguration;
 use tokio::sync::RwLock;
 use pnet::packet::MutablePacket;
 
@@ -21,8 +23,24 @@ struct State{
     ip_to_mac: HashMap<u32,[u8;6]>,
     ip_to_ifidx: HashMap<u32,u32>,
     ifidx_to_vrf: HashMap<u32,u32>,
-    routes: HashMap<u32, Vec<HashMap<u32, Vec<(u32, u32, [u8; 6])>>>>,
+    routes: HashMap<u32, NetlinkRouteList>,
     gateway_mac_table: HashMap<u32, [u8;6]>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct NetlinkRouteList(Vec<HashMap<u32, Vec<(u32, u32, [u8; 6])>>>);
+
+impl Display for NetlinkRouteList{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (prefix_len, prefix_map) in self.0.iter().enumerate(){
+            for (prefix, route_list) in prefix_map{
+                for route in route_list{
+                    write!(f, "prefix_len: {} prefix: {} gw: {:?}, oif: {}, oif mac {:?}", prefix_len, Ipv4Addr::from(*prefix), Ipv4Addr::from(route.0), route.1, MacAddr::from(route.2))?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -34,6 +52,16 @@ pub struct NetlinkBridge{
     pub mac: [u8;6],
 }
 
+impl Display for NetlinkBridge{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ip_string = String::new();
+        for (ip, prefix) in &self.ips{
+            ip_string.push_str(&format!("{}/{} ", Ipv4Addr::from(*ip), prefix));
+        }
+        write!(f, "idx: {} mac: {:?} ips: {:?} vrf: {:?}", self.idx, MacAddr::from(self.mac), ip_string, self.vrf)
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct NetlinkInterface{
     pub mac: [u8;6],
@@ -43,20 +71,32 @@ pub struct NetlinkInterface{
     pub vrf: Option<u32>,
 }
 
+impl Display for NetlinkInterface{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ip_string = String::new();
+        for (ip, prefix) in &self.ips{
+            ip_string.push_str(&format!("{}/{} ", Ipv4Addr::from(*ip), prefix));
+        }
+        write!(f, "idx: {} mac: {:?} ips: {:?} bridge_id: {:?} vrf: {:?}", self.idx, MacAddr::from(self.mac), ip_string, MacAddr::from(self.bridge_id.unwrap_or_default()), self.vrf)
+    }
+}
+
 pub struct NetworkState{
     rx: Arc<RwLock<tokio::sync::mpsc::Receiver<NetworkStateCommand>>>,
     client: NetworkStateClient,
+    global_interface_configuration: Arc<Mutex<BpfHashMap<MapData, u32, InterfaceConfiguration>>>,
     interface_list: HashMap<u32, Interface>,
     state: State,
 }
 
 impl NetworkState{
-    pub fn new(interface_list: HashMap<u32, Interface>) -> Self{
+    pub fn new(interface_list: HashMap<u32, Interface>, global_interface_configuration: Arc<Mutex<BpfHashMap<MapData, u32, InterfaceConfiguration>>>) -> Self{
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let client = NetworkStateClient::new(tx);
         Self{
             rx: Arc::new(RwLock::new(rx)),
             client,
+            global_interface_configuration,
             interface_list,
             state: State::default(),
         }
@@ -70,6 +110,7 @@ impl NetworkState{
             let mac = get_mac_address_from_ifidx(*ifidx).await;
             let vrf = get_vrf_from_ifidx(*ifidx).await;
             let mut interface = NetlinkInterface::default();
+            let mut interface_configuration = InterfaceConfiguration::default();
             for (ip, _) in &addresses{
                 self.state.ip_to_ifidx.insert(*ip, *ifidx);
                 self.state.ip_to_mac.insert(*ip, mac);
@@ -80,11 +121,14 @@ impl NetworkState{
             interface.vrf = vrf;
             if let Some(vrf) = vrf{
                 self.state.ifidx_to_vrf.insert(*ifidx, vrf);
+                interface_configuration.vrf = vrf;
             }
             
             let bridge_id = get_bridge_id_from_ifidx(*ifidx).await;
             if let Some(bridge_id) = bridge_id{
                 interface.bridge_id = Some(bridge_id);
+                interface_configuration.bridge_id = bridge_id;
+                interface_configuration.l2 = 1;
                 if let Some(bridge) = self.state.bridges.get_mut(&bridge_id){
                     bridge.interfaces.insert(*ifidx);
                 } else {
@@ -110,6 +154,7 @@ impl NetworkState{
             self.state.interfaces.insert(*ifidx, interface);
             self.state.ifidx_to_mac.insert(*ifidx, mac);
             self.state.mac_to_ifidx.insert(mac, *ifidx);
+            self.global_interface_configuration.lock().unwrap().insert(*ifidx, interface_configuration, 0).unwrap();
 
         }
 
@@ -177,7 +222,7 @@ impl NetworkState{
         if let Some(route_map) = self.state.routes.get(&vrf){
             for i in (1..=32).rev(){
                 let masked_prefix = prefix & (0xFFFFFFFF << (32 - i));
-                if let Some(route_list) = route_map[i].get(&masked_prefix){
+                if let Some(route_list) = route_map.0[i].get(&masked_prefix){
                     routes = route_list.clone();
                 }
             }
@@ -186,7 +231,7 @@ impl NetworkState{
         }
         routes
     }
-    async fn create_routes_for_vrfs(&self) -> (HashMap<u32, Vec<HashMap<u32,Vec<(u32, u32, [u8;6])>>>>, Vec<(NetlinkInterface, u32)>){
+    async fn create_routes_for_vrfs(&self) -> (HashMap<u32, NetlinkRouteList>, Vec<(NetlinkInterface, u32)>){
         let interfaces = self.state.interfaces.clone();
         let mut vrfs = HashSet::new();
         for interface in interfaces.values(){
@@ -194,7 +239,7 @@ impl NetworkState{
                 vrfs.insert(vrf_);
             }
         }
-        let mut vrf_routes: HashMap<u32, Vec<HashMap<u32,Vec<(u32, u32, [u8;6])>>>> = HashMap::new();
+        let mut vrf_routes: HashMap<u32, NetlinkRouteList> = HashMap::new();
         let mut gateway_oif: Vec<(NetlinkInterface, u32)> = Vec::new();
         let (connection, handle, _) = new_connection().unwrap();
         tokio::spawn(connection);
@@ -223,13 +268,13 @@ impl NetworkState{
                                     }
                                     if let Some(gateway_ip) = gateway_ip{
                                         if let Some(map) = vrf_routes.get_mut(&(route_message.header.table as u32)){
-                                            if let Some(list) = map[prefix_len as usize].get_mut(&u32::from_be_bytes(prefix.octets())){
+                                            if let Some(list) = map.0[prefix_len as usize].get_mut(&u32::from_be_bytes(prefix.octets())){
                                                 list.push((gateway_ip, *oif, interfaces[oif].mac));
                                             } else {
-                                                if map.get(prefix_len as usize).is_none(){
-                                                    map[prefix_len as usize] = HashMap::new();
+                                                if map.0.get(prefix_len as usize).is_none(){
+                                                    map.0[prefix_len as usize] = HashMap::new();
                                                 }
-                                                map[prefix_len as usize].insert(
+                                                map.0[prefix_len as usize].insert(
                                                     u32::from_be_bytes(prefix.octets()),
                                                     vec![(gateway_ip, *oif, interfaces[oif].mac)]
                                                 );
@@ -241,7 +286,7 @@ impl NetworkState{
                                                 u32::from_be_bytes(prefix.octets()),
                                                 vec![(gateway_ip, *oif, interfaces[oif].mac)]
                                             );
-                                            vrf_routes.insert(route_message.header.table as u32, route);
+                                            vrf_routes.insert(route_message.header.table as u32, NetlinkRouteList(route));
                                         }
                                     }
                                 }
@@ -263,13 +308,13 @@ impl NetworkState{
                                         }
                                         if let Some(gateway_ip) = gateway_ip{
                                             if let Some(map) = vrf_routes.get_mut(&(route_message.header.table as u32)){
-                                                if let Some(list) = map[prefix_len as usize].get_mut(&u32::from_be_bytes(prefix.octets())){
+                                                if let Some(list) = map.0[prefix_len as usize].get_mut(&u32::from_be_bytes(prefix.octets())){
                                                     list.push((gateway_ip, route_next_hop.interface_index, interfaces[&route_next_hop.interface_index].mac));
                                                 } else {
-                                                    if map.get(prefix_len as usize).is_none(){
-                                                        map[prefix_len as usize] = HashMap::new();
+                                                    if map.0.get(prefix_len as usize).is_none(){
+                                                        map.0[prefix_len as usize] = HashMap::new();
                                                     }
-                                                    map[prefix_len as usize].insert(
+                                                    map.0[prefix_len as usize].insert(
                                                         u32::from_be_bytes(prefix.octets()),
                                                         vec![(gateway_ip, route_next_hop.interface_index, interfaces[&route_next_hop.interface_index].mac)]
                                                     );
@@ -281,7 +326,7 @@ impl NetworkState{
                                                     u32::from_be_bytes(prefix.octets()),
                                                     vec![(gateway_ip, route_next_hop.interface_index, interfaces[&route_next_hop.interface_index].mac)]
                                                 );
-                                                vrf_routes.insert(route_message.header.table as u32, route);
+                                                vrf_routes.insert(route_message.header.table as u32, NetlinkRouteList(route));
                                             }
                                         } else {
                                             info!("No gateway ip for route_next_hop: {:?}", route_next_hop);
@@ -299,13 +344,8 @@ impl NetworkState{
     }
     fn print_route_table(&self){
         for (vrf, route_map) in &self.state.routes{
-            for (prefix_len, prefix_map) in route_map.iter().enumerate(){
-                for (prefix, route_list) in prefix_map{
-                    for route in route_list{
-                        info!("vrf: {} prefix_len: {} prefix: {} gw: {:?}, oif: {}, oif mac {:?}", vrf, prefix_len, Ipv4Addr::from(*prefix), Ipv4Addr::from(route.0), route.1, MacAddr::from(route.2));
-                    }
-                }
-            }
+            info!("VRF: {}", vrf);
+            info!("{}", route_map);
         }
     }
     async fn send_arp_request(&self, prefix: u32, src_mac: [u8;6], src_ip: u32, dst_ifidx: u32) -> Option<[u8;6]>{
