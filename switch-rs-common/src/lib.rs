@@ -49,7 +49,7 @@ impl InterfaceQueue {
 unsafe impl aya::Pod for InterfaceQueue {}
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct FlowKey{
     pub src_ip: u32,
     pub dst_ip: u32,
@@ -69,6 +69,8 @@ pub struct FlowNextHop{
     pub next_hop_count: u32,
     pub next_hop_idx: u32,
     pub packet_count: u32,
+    pub active_next_hop: u32,
+    pub max_packets: u32,
 }
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FlowNextHop {}

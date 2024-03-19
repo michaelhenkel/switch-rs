@@ -4,19 +4,20 @@ use log::{error, info};
 use pnet::{ipnetwork::IpNetwork, packet::{arp::{ArpOperations, MutableArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, icmp::{IcmpTypes, MutableIcmpPacket}, ip::IpNextHeaderProtocols, ipv4::MutableIpv4Packet, Packet}, util::MacAddr};
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use switch_rs_common::{ArpEntry, FlowKey, FlowNextHop};
-use crate::{af_xdp::{af_xdp::PacketHandler, interface::interface::Interface}, network_state::network_state::NetworkStateClient};
+use crate::{af_xdp::{af_xdp::PacketHandler, interface::interface::Interface}, flow_manager::flow_manager::{Flow,FwdRevFlow}, network_state::network_state::NetworkStateClient};
 use rtnetlink::new_connection;
 use netlink_packet_route::link::{InfoBridgePort, InfoPortData, LinkAttribute, LinkInfo};
 use pnet::packet::MutablePacket;
 use futures::TryStreamExt;
+use crate::flow_manager::flow_manager::FlowManagerClient;
 #[derive(Clone)]
 pub struct Handler{
     interface_list: HashMap<u32, Interface>,
     local_mac_table: HashMap<[u8;6], u32>,
     global_mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
-    global_flow_table: Arc<Mutex<BpfHashMap<MapData, switch_rs_common::FlowKey, switch_rs_common::FlowNextHop>>>,
     global_arp_table: Arc<Mutex<BpfHashMap<MapData, u32, ArpEntry>>>,
     network_state_client: NetworkStateClient,
+    flow_manager_client: FlowManagerClient,
 }
 
 #[async_trait]
@@ -42,18 +43,18 @@ impl PacketHandler for Handler {
 impl Handler {
     pub fn new(interface_list: HashMap<u32, Interface>,
         global_mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
-        global_flow_table: Arc<Mutex<BpfHashMap<MapData, switch_rs_common::FlowKey, switch_rs_common::FlowNextHop>>>,
         global_arp_table: Arc<Mutex<BpfHashMap<MapData, u32, ArpEntry>>>,
         network_state_client: NetworkStateClient,
+        flow_manager_client: FlowManagerClient,
     ) -> Handler {
 
         Handler{
             interface_list,
             local_mac_table: HashMap::new(),
             global_mac_table,
-            global_flow_table,
             global_arp_table,
             network_state_client,
+            flow_manager_client,
         }
     }
     async fn arp_handler(&mut self, eth_packet: &mut MutableEthernetPacket<'_>, ifidx: u32, queue_id: u32) -> Option<Vec<(u32, u32)>>{
@@ -168,9 +169,11 @@ impl Handler {
                 src_port,
                 dst_port,
             };
-            if let Ok(flow_next_hop) = self.global_flow_table.lock().unwrap().get(&flow_key, 0){
-                info!("found flow_next_hop: {:?}", flow_next_hop);
-                return Some(vec![(flow_next_hop.ifidx, flow_next_hop.queue_id)]);
+            if let Ok(ifidx_queue_id) = self.flow_manager_client.get_ifidx_queue(flow_key).await{
+                if let Some((ifidx, queue_id)) = ifidx_queue_id{
+                    info!("found flow_next_hop: {:?}", ifidx_queue_id);
+                    return Some(vec![(ifidx, queue_id)]);
+                }
             } else {
                 info!("flow_next_hop not found");
             }
@@ -192,23 +195,62 @@ impl Handler {
 
         if ret.is_some(){
             if let Some((src_port, dst_port)) = src_dst_port{
-                add_flow(
-                    self.global_flow_table.clone(),
-                    u32::from_be_bytes(src_ip.octets()),
-                    u32::from_be_bytes(dst_ip.octets()),
+                let fwd_flow_key = FlowKey{
+                    src_ip: u32::from_be_bytes(src_ip.octets()),
+                    dst_ip: u32::from_be_bytes(dst_ip.octets()),
                     src_port,
                     dst_port,
-                    ifidx,
-                    ret.as_ref().unwrap()[0].0,
+                };
+                let fwd_flow_next_hop = FlowNextHop{
+                    ifidx: ret.as_ref().unwrap()[0].0,
                     queue_id,
                     src_mac,
                     dst_mac,
-                    dst_mac,
-                    src_mac,
-                    0,
-                    0,
-                    0,
-                );
+                    next_hop_count: 0,
+                    next_hop_idx: 0,
+                    packet_count: 0,
+                    active_next_hop: 0,
+                    max_packets: 0,
+                };
+
+                let fwd_flow = Flow{
+                    key: fwd_flow_key,
+                    next_hops: vec![fwd_flow_next_hop],
+                };
+    
+
+                let rev_flow_key = FlowKey{
+                    src_ip: u32::from_be_bytes(dst_ip.octets()),
+                    dst_ip: u32::from_be_bytes(src_ip.octets()),
+                    src_port: dst_port,
+                    dst_port: src_port,
+                };
+
+                let rev_flow_next_hop = FlowNextHop{
+                    ifidx,
+                    queue_id,
+                    src_mac: dst_mac,
+                    dst_mac: src_mac,
+                    next_hop_count: 0,
+                    next_hop_idx: 0,
+                    packet_count: 0,
+                    active_next_hop: 0,
+                    max_packets: 0,
+                };
+
+                let rev_flow = Flow{
+                    key: rev_flow_key,
+                    next_hops: vec![rev_flow_next_hop],
+                };
+
+
+
+                let fwd_rev_flow = FwdRevFlow{
+                    fwd: fwd_flow,
+                    rev: rev_flow,
+                };
+                self.flow_manager_client.add_flow(fwd_rev_flow).await.
+                    unwrap_or_else(|e| error!("Failed to add flow: {}", e));
             }
             return ret
         }
@@ -223,23 +265,60 @@ impl Handler {
                     eth_packet.set_destination(arp_entry.smac.into());
                     eth_packet.set_source(bridge_id.into());
                     if let Some((src_port, dst_port)) = src_dst_port{
-                        add_flow(
-                            self.global_flow_table.clone(),
-                            u32::from_be_bytes(src_ip.octets()),
-                            u32::from_be_bytes(dst_ip.octets()),
+                        let fwd_flow_key = FlowKey{
+                            src_ip: u32::from_be_bytes(src_ip.octets()),
+                            dst_ip: u32::from_be_bytes(dst_ip.octets()),
                             src_port,
                             dst_port,
-                            ifidx,
-                            arp_entry.ifidx,
+                        };
+
+                        let fwd_flow_next_hop = FlowNextHop{
+                            ifidx: arp_entry.ifidx,
                             queue_id,
-                            bridge_id,
-                            arp_entry.smac,
-                            dst_mac,
-                            src_mac,
-                            0,
-                            0,
-                            0,
-                        );
+                            src_mac: bridge_id,
+                            dst_mac: arp_entry.smac,
+                            next_hop_count: 0,
+                            next_hop_idx: 0,
+                            packet_count: 0,
+                            active_next_hop: 0,
+                            max_packets: 0,
+                        };
+
+                        let fwd_flow = Flow{
+                            key: fwd_flow_key,
+                            next_hops: vec![fwd_flow_next_hop],
+                        };
+
+                        let rev_flow_key = FlowKey{
+                            src_ip: u32::from_be_bytes(dst_ip.octets()),
+                            dst_ip: u32::from_be_bytes(src_ip.octets()),
+                            src_port: dst_port,
+                            dst_port: src_port,
+                        };
+                        let rev_flow_next_hop = FlowNextHop{
+                            ifidx,
+                            queue_id,
+                            src_mac: dst_mac,
+                            dst_mac: src_mac,
+                            next_hop_count: 0,
+                            next_hop_idx: 0,
+                            packet_count: 0,
+                            active_next_hop: 0,
+                            max_packets: 0,
+                        };
+
+                        let rev_flow = Flow{
+                            key: rev_flow_key,
+                            next_hops: vec![rev_flow_next_hop],
+                        };
+
+                        let fwd_rev_flow = FwdRevFlow{
+                            fwd: fwd_flow,
+                            rev: rev_flow,
+                        };
+                    
+                        self.flow_manager_client.add_flow(fwd_rev_flow).await.
+                            unwrap_or_else(|e| error!("Failed to add flow: {}", e));
                     }
                     return Some(vec![(arp_entry.ifidx, queue_id)]);
                 }
@@ -262,34 +341,87 @@ impl Handler {
         if let Some(vrf) = vrf{
             info!("vrf: {:?}", vrf);
             let routes = self.network_state_client.get_routes(u32::from_be_bytes(dst_ip.octets()), vrf).await;
-            for (gateway_ip, oif_idx, mac) in routes{
-                info!("gateway_ip: {:?}, oif_idx: {:?}, mac: {:?}", Ipv4Addr::from(gateway_ip), oif_idx, MacAddr::from(mac));
-                if let Some(gateway_mac) = self.network_state_client.get_gateway_mac_from_prefix(gateway_ip).await{
+            let next_hop_count = routes.len() as u32;
+            let mut ret = None;
+
+            let mut fwd_rev_flow = if let Some((src_port, dst_port)) = src_dst_port{
+                let fwd_flow_key = FlowKey{
+                    src_ip: u32::from_be_bytes(src_ip.octets()),
+                    dst_ip: u32::from_be_bytes(dst_ip.octets()),
+                    src_port,
+                    dst_port,
+                };
+                let fwd_flow = Flow{
+                    key: fwd_flow_key,
+                    next_hops: Vec::new(),
+                };
+                let rev_flow_key = FlowKey{
+                    src_ip: u32::from_be_bytes(dst_ip.octets()),
+                    dst_ip: u32::from_be_bytes(src_ip.octets()),
+                    src_port: dst_port,
+                    dst_port: src_port,
+                };
+                let rev_flow_next_hop = FlowNextHop{
+                    ifidx,
+                    queue_id,
+                    src_mac: dst_mac,
+                    dst_mac: src_mac,
+                    next_hop_count,
+                    next_hop_idx: 0,
+                    packet_count: 0,
+                    active_next_hop: 0,
+                    max_packets: 0,
+                };
+                let rev_flow = Flow{
+                    key: rev_flow_key,
+                    next_hops: vec![rev_flow_next_hop],
+                };
+                let fwd_rev_flow = FwdRevFlow{
+                    fwd: fwd_flow,
+                    rev: rev_flow,
+                };
+                Some(fwd_rev_flow)
+            } else {
+                None
+            };
+
+            for (idx, (gateway_ip, oif_idx, mac)) in routes.iter().enumerate(){
+                info!("gateway_ip: {:?}, oif_idx: {:?}, mac: {:?}", Ipv4Addr::from(*gateway_ip), oif_idx, MacAddr::from(*mac));
+                if let Some(gateway_mac) = self.network_state_client.get_gateway_mac_from_prefix(*gateway_ip).await{
                     info!("gateway_mac: {:?}", MacAddr::from(gateway_mac));
                     eth_packet.set_destination(gateway_mac.into());
-                    eth_packet.set_source(mac.into());
-                    if let Some((src_port, dst_port)) = src_dst_port{
-                        add_flow(
-                            self.global_flow_table.clone(),
-                            u32::from_be_bytes(src_ip.octets()),
-                            u32::from_be_bytes(dst_ip.octets()),
-                            src_port,
-                            dst_port,
-                            ifidx,
-                            oif_idx,
-                            queue_id,
-                            mac,
-                            gateway_mac,
-                            dst_mac,
-                            src_mac,
-                            0,
-                            0,
-                            0,
-                        );
-                    }
-                    return Some(vec![(oif_idx, queue_id)]);
+                    eth_packet.set_source(mac.clone().into());
+                    let fwd_flow_next_hop = FlowNextHop{
+                        ifidx: *oif_idx,
+                        queue_id,
+                        src_mac: mac.clone(),
+                        dst_mac: gateway_mac,
+                        next_hop_count,
+                        next_hop_idx: idx as u32,
+                        packet_count: 0,
+                        active_next_hop: 0,
+                        max_packets: 100,
+                    };
+                    fwd_rev_flow.as_mut().unwrap().fwd.next_hops.push(fwd_flow_next_hop);
+                    ret = Some(vec![(*oif_idx, queue_id)]);
                 }
             }
+
+            if let Some(fwd_rev_flow) = fwd_rev_flow{
+                let fwd_flow_key = fwd_rev_flow.fwd.key;
+                self.flow_manager_client.add_flow(fwd_rev_flow).await.
+                    unwrap_or_else(|e| error!("Failed to add flow: {}", e));
+                if let Ok(res) = self.flow_manager_client.get_ifidx_queue(fwd_flow_key).await{
+                    if let Some((ifidx, queue_id)) = res{
+                        return Some(vec![(ifidx, queue_id)]);
+                    }
+                } else if ret.is_some(){
+                    return ret
+                }
+            } else if ret.is_some(){
+                return ret
+            }
+
             let bridges = self.network_state_client.get_bridges_from_vrf(vrf).await;
             for bridge in &bridges{
                 for (prefix, prefix_len) in &bridge.ips{
@@ -308,23 +440,62 @@ impl Handler {
                                 eth_packet.set_destination(dst_mac.into());
                                 eth_packet.set_source(bridge.mac.into());
                                 if let Some((src_port, dst_port)) = src_dst_port{
-                                    add_flow(
-                                        self.global_flow_table.clone(),
-                                        u32::from_be_bytes(src_ip.octets()),
-                                        u32::from_be_bytes(dst_ip.octets()),
+
+                                    let fwd_flow_key = FlowKey{
+                                        src_ip: u32::from_be_bytes(src_ip.octets()),
+                                        dst_ip: u32::from_be_bytes(dst_ip.octets()),
                                         src_port,
                                         dst_port,
-                                        ifidx,
-                                        *interface,
+                                    };
+
+                                    let fwd_flow_next_hop = FlowNextHop{
+                                        ifidx: *interface,
                                         queue_id,
-                                        bridge.mac,
+                                        src_mac: bridge.mac,
                                         dst_mac,
-                                        dst_mac,
-                                        src_mac,
-                                        0,
-                                        0,
-                                        0,
-                                    );
+                                        next_hop_count,
+                                        next_hop_idx: 0,
+                                        packet_count: 0,
+                                        active_next_hop: 0,
+                                        max_packets: 0,
+                                    };
+
+                                    let fwd_flow = Flow{
+                                        key: fwd_flow_key,
+                                        next_hops: vec![fwd_flow_next_hop],
+                                    };
+
+                                    let rev_flow_key = FlowKey{
+                                        src_ip: u32::from_be_bytes(dst_ip.octets()),
+                                        dst_ip: u32::from_be_bytes(src_ip.octets()),
+                                        src_port: dst_port,
+                                        dst_port: src_port,
+                                    };
+
+                                    let rev_flow_next_hop = FlowNextHop{
+                                        ifidx,
+                                        queue_id,
+                                        src_mac: dst_mac,
+                                        dst_mac: src_mac,
+                                        next_hop_count,
+                                        next_hop_idx: 0,
+                                        packet_count: 0,
+                                        active_next_hop: 0,
+                                        max_packets: 0,
+                                    };
+
+                                    let rev_flow = Flow{
+                                        key: rev_flow_key,
+                                        next_hops: vec![rev_flow_next_hop],
+                                    };
+
+                                    let fwd_rev_flow = FwdRevFlow{
+                                        fwd: fwd_flow,
+                                        rev: rev_flow,
+                                    };
+
+                                    self.flow_manager_client.add_flow(fwd_rev_flow).await.
+                                        unwrap_or_else(|e| error!("Failed to add flow: {}", e));
                                 }
                                 return Some(vec![(*interface, queue_id)]);
                             } else {
@@ -376,59 +547,4 @@ async fn get_interface_by_index(idx: u32)  -> Option<[u8;6]>{
         }
     }
     bridge_id_res
-}
-
-fn add_flow(
-    flow_table: Arc<Mutex<BpfHashMap<MapData, FlowKey, FlowNextHop>>>,
-    src_ip: u32,
-    dst_ip: u32,
-    src_port: u16,
-    dst_port: u16,
-    ifidx: u32,
-    oif_idx: u32,
-    queue_id: u32,
-    fwd_src_mac: [u8;6],
-    fwd_dst_mac: [u8;6],
-    rev_src_mac: [u8;6],
-    rev_dst_mac: [u8;6],
-    next_hop_count: u32,
-    next_hop_idx: u32,
-    packet_count: u32,
-
-){
-    let mut flow_table = flow_table.lock().unwrap();
-    let fwd_flow_key = FlowKey{
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-    };
-    let fwd_flow_next_hop = FlowNextHop{
-        ifidx: oif_idx,
-        queue_id,
-        src_mac: fwd_src_mac,
-        dst_mac: fwd_dst_mac,
-        next_hop_count,
-        next_hop_idx,
-        packet_count,
-    };
-    flow_table.insert(&fwd_flow_key, &fwd_flow_next_hop, 0).unwrap();
-    
-    let rev_flow_key = FlowKey{
-        src_ip: dst_ip,
-        dst_ip: src_ip,
-        src_port: dst_port,
-        dst_port: src_port,
-    };
-    let rev_flow_next_hop = FlowNextHop{
-        ifidx,
-        queue_id,
-        src_mac: rev_src_mac,
-        dst_mac: rev_dst_mac,
-        next_hop_count,
-        next_hop_idx,
-        packet_count,
-    };
-    flow_table.insert(&rev_flow_key, &rev_flow_next_hop, 0).unwrap();
-    
 }

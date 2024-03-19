@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use switch_rs_common::InterfaceQueue;
 use tokio::sync::{RwLock, RwLockWriteGuard};
-use xdpilone::{xdp::XdpDesc, DeviceQueue, RingRx, RingTx};
+use xdpilone::{xdp::XdpDesc, DeviceQueue, RingRx, RingTx, WriteFill};
 use aya::maps::{HashMap as BpfHashMap, MapData, XskMap};
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 use log::{error, info};
@@ -31,14 +31,45 @@ struct MyDeviceQueue(DeviceQueue);
 unsafe impl Send for MyDeviceQueue {}
 unsafe impl Sync for MyDeviceQueue {}
 
-struct SafeType {
+struct SafeDeviceQueue {
     inner: Mutex<MyDeviceQueue>,
 }
 
-impl SafeType {
-    fn some_method(&self) {
-        let locked = self.inner.lock();
-        // use ptr in `locked` to implement functionality, but don't return it
+impl SafeDeviceQueue {
+    pub fn fill(&mut self, desc_list: &mut VecDeque<u64>, failed: &mut VecDeque<u64>) -> anyhow::Result<u32> {
+        let mut fq_cq = self.inner.lock().unwrap();
+        let mut writer = fq_cq.0.fill(desc_list.len() as u32);
+        let mut filled = 0;
+        while let Some(addr) = desc_list.pop_front() {
+            if writer.insert_once(addr) {
+                filled += 1;
+            } else {
+                failed.push_back(addr);
+            }
+        }
+        writer.commit();
+        Ok(filled)
+    }
+    pub fn complete(&mut self, total_queues: u32, complete_address_list: &mut HashMap<u64, Arc<Mutex<VecDeque<u64>>>>) -> anyhow::Result<u32> {
+        let mut fq_cq = self.inner.lock().unwrap();
+        let mut completed = 0;
+        let available = fq_cq.0.available();
+        let mut reader = fq_cq.0.complete(available);
+        while let Some(addr) = reader.read() {
+            let addr = addr - HEADROOM as u64;
+            let interval = BUFFER_SIZE / total_queues;
+            let queue_idx = addr / interval as u64;
+            let queue_idx = queue_idx.min(total_queues as u64 - 1);
+            complete_address_list.get(&queue_idx).unwrap().lock().unwrap().push_back(addr);
+            completed += 1;
+        }
+        reader.release();
+        Ok(completed)
+    }
+    pub fn pending(&mut self) -> anyhow::Result<u32> {
+        let fq_cq = self.inner.lock().unwrap();
+        let pending = fq_cq.0.pending();
+        Ok(pending)
     }
 }
 
@@ -367,6 +398,7 @@ impl Queue{
                     total_fill_list_counter += complete_fill_list.len();
                     loop{
                         let mut failed_list = VecDeque::new();
+                        
                         let filled_temp = fill(&mut fq_cq, &mut complete_fill_list, &mut failed_list).unwrap();
                         total_fill_counter += filled_temp;
                         if failed_list.len() == 0{
