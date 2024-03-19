@@ -11,13 +11,13 @@ use log::{error, info};
 use super::interface::interface::Interface;
 
 //const BUFFER_SIZE: u32 = 1 << 16;
-const BATCH_SIZE: u32 = 64;
+const BATCH_SIZE: u32 = 256;
 const FRAME_SIZE: u32 = 1 << 12;
 const HEADROOM: u32 = 1 << 8;
 //const PAYLOAD_SIZE: u32 = FRAME_SIZE - HEADROOM;
-const BUFFER_SIZE: u32 = 1 << 24;
+const BUFFER_SIZE: u32 = 1 << 26;
 const THRESOLD_FACTOR: u32 = 8;
-const RX_INTERVAL: u64 = 50;
+const RX_INTERVAL: u64 = 500;
 const COMPLETE_INTERVAL: u64 = 10;
 #[repr(align(4096))]
 struct PacketMap(UnsafeCell<[u8; BUFFER_SIZE as usize]>);
@@ -423,7 +423,9 @@ impl Queue{
 
                     if let Some(buf) = frame_buffer.get_mut(&buf_idx) {
                         let mut buf = &mut buf.as_mut()[offset as usize..];
+                        //let now = tokio::time::Instant::now();
                         if let Some(list) = handler.handle_packet(&mut buf, ifidx, queue_id).await{
+                            //info!("took: {} micros", now.elapsed().as_micros());
                             for (ifidx, queue_id) in list{
                                 send_map.get_mut(&(ifidx, queue_id)).unwrap().push_back(desc);
                             }
@@ -504,7 +506,7 @@ impl Queue{
                     
                     
                     let mut complete_fill_list: VecDeque<u64> = complete_list.lock().unwrap().drain(0..).collect();
-                    info!("{} 2 pending: {} threshold: {}, complete_fill_list: {}", queue_id_ifidx, pending_cnt, thresholds, complete_fill_list.len());
+                    error!("{} 2 pending: {} threshold: {}, complete_fill_list: {}", queue_id_ifidx, pending_cnt, thresholds, complete_fill_list.len());
                     total_fill_list_counter += complete_fill_list.len();
                     loop{
                         let mut failed_list = VecDeque::new();

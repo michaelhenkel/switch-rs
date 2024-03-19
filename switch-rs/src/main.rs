@@ -146,10 +146,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let mac_table_mutex = Arc::new(Mutex::new(mac_table));
     let arp_table_mutex = Arc::new(Mutex::new(arp_table));
     let interface_configuration_mutex = Arc::new(Mutex::new(interface_configuration));
+    let flow_table_mutex = Arc::new(Mutex::new(flow_table));
 
-    let mut flow_manager = FlowManager::new(flow_table);
+    let mut flow_manager = FlowManager::new(flow_table_mutex.clone());
     let mut network_state = NetworkState::new(interface_list.clone(), interface_configuration_mutex);
-    let handler = handler::handler::Handler::new(interface_list.clone(), mac_table_mutex, arp_table_mutex, network_state.client(), flow_manager.client());
+    let handler = handler::handler::Handler::new(interface_list.clone(), mac_table_mutex, arp_table_mutex, flow_table_mutex.clone(), network_state.client(), flow_manager.client(), );
     let afxdp = AfXdp::new(interface_list.clone(), xsk_map, interface_queue_table);
     let mut jh_list = Vec::new();
     let handler_clone = handler.clone();
@@ -157,6 +158,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let jh = tokio::spawn(async move {
         flow_manager.run().await;
     });
+    jh_list.push(jh);
 
     let jh = tokio::spawn(async move {
         network_state.run().await;

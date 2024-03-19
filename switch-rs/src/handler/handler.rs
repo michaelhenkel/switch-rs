@@ -16,6 +16,7 @@ pub struct Handler{
     local_mac_table: HashMap<[u8;6], u32>,
     global_mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
     global_arp_table: Arc<Mutex<BpfHashMap<MapData, u32, ArpEntry>>>,
+    global_flow_table: Arc<Mutex<BpfHashMap<MapData, FlowKey, FlowNextHop>>>,
     network_state_client: NetworkStateClient,
     flow_manager_client: FlowManagerClient,
 }
@@ -44,6 +45,7 @@ impl Handler {
     pub fn new(interface_list: HashMap<u32, Interface>,
         global_mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
         global_arp_table: Arc<Mutex<BpfHashMap<MapData, u32, ArpEntry>>>,
+        global_flow_table: Arc<Mutex<BpfHashMap<MapData, FlowKey, FlowNextHop>>>,
         network_state_client: NetworkStateClient,
         flow_manager_client: FlowManagerClient,
     ) -> Handler {
@@ -53,6 +55,7 @@ impl Handler {
             local_mac_table: HashMap::new(),
             global_mac_table,
             global_arp_table,
+            global_flow_table,
             network_state_client,
             flow_manager_client,
         }
@@ -62,7 +65,6 @@ impl Handler {
         let op = arp_packet.get_operation();
         match op{
             ArpOperations::Request => {
-                info!("ARP request");
                 let src_mac = arp_packet.get_sender_hw_addr();
                 // add sender mac to mac table
                 self.local_mac_table.insert(src_mac.into(), ifidx);
@@ -125,14 +127,12 @@ impl Handler {
         None
     }
     async fn ipv4_handler(&mut self, eth_packet: &mut MutableEthernetPacket<'_>, queue_id: u32, ifidx: u32) -> Option<Vec<(u32, u32)>>{
-        info!("IPv4 packet on intf {}", ifidx);
         let dst_mac: [u8;6] = eth_packet.get_destination().into();
         let src_mac: [u8;6] = eth_packet.get_source().into();
-        info!("dst_mac: {:?}, src_mac: {:?}", dst_mac, src_mac);
         let mut ip_packet = MutableIpv4Packet::new(eth_packet.payload_mut()).unwrap();
         let dst_ip = ip_packet.get_destination();
         let src_ip = ip_packet.get_source();
-        info!("src_ip: {:?}, dst_ip: {:?}", src_ip, dst_ip);
+
 
         let src_dst_port = match ip_packet.get_next_level_protocol(){
             IpNextHeaderProtocols::Tcp => {
@@ -161,7 +161,7 @@ impl Handler {
                 None
             },
         };
-        info!("checking flow table");
+
         if let Some((src_port, dst_port)) = src_dst_port{
             let flow_key = FlowKey{
                 src_ip: u32::from_be_bytes(ip_packet.get_source().octets()),
@@ -169,25 +169,25 @@ impl Handler {
                 src_port,
                 dst_port,
             };
+            if let Some(flow_next_hop) = self.global_flow_table.lock().unwrap().get(&flow_key, 0).ok(){
+                eth_packet.set_destination(flow_next_hop.dst_mac.into());
+                eth_packet.set_source(flow_next_hop.src_mac.into());
+                return Some(vec![(flow_next_hop.ifidx, flow_next_hop.queue_id)]);
+            }
             if let Ok(ifidx_queue_id) = self.flow_manager_client.get_ifidx_queue(flow_key).await{
-                if let Some((ifidx, queue_id)) = ifidx_queue_id{
-                    info!("found flow_next_hop: {:?}", ifidx_queue_id);
-                    return Some(vec![(ifidx, queue_id)]);
+                if let Some(flow_next_hop) = ifidx_queue_id{
+                    eth_packet.set_destination(flow_next_hop.dst_mac.into());
+                    eth_packet.set_source(flow_next_hop.src_mac.into());
+                    return Some(vec![(flow_next_hop.ifidx, flow_next_hop.queue_id)]);
                 }
-            } else {
-                info!("flow_next_hop not found");
             }
         }
         
-        info!("checking local_mac_table");
         let mut ret = None;
         if let Some(dst_ifidx) = self.local_mac_table.get(&dst_mac){
-            info!("found dst_ififx {} in local_mac_table {:?}", dst_ifidx, MacAddr::from(dst_mac));
             ret = Some(vec![(*dst_ifidx, queue_id)]);
         } else {
-            info!("checking global_mac_table");
             if let Ok(dst_ifidx) = self.global_mac_table.lock().unwrap().get(&dst_mac.into(),0){
-                info!("found dst_ififx {} in global_mac_table {:?}", dst_ifidx, MacAddr::from(dst_mac));
                 self.local_mac_table.insert(dst_mac, dst_ifidx);
                 ret = Some(vec![(dst_ifidx, queue_id)]);
             }
@@ -254,14 +254,11 @@ impl Handler {
             }
             return ret
         }
-
-        info!("checking arp_table");
         
         let arp_entry = self.global_arp_table.lock().unwrap().get(&u32::from_be_bytes(dst_ip.octets()), 0).ok();
         if let Some(arp_entry) = arp_entry{
             if let Some(intf) = self.network_state_client.get_interface(ifidx).await{
                 if let Some(bridge_id) = intf.bridge_id{   
-                    info!("found arp_entry: {:?}", arp_entry);
                     eth_packet.set_destination(arp_entry.smac.into());
                     eth_packet.set_source(bridge_id.into());
                     if let Some((src_port, dst_port)) = src_dst_port{
@@ -325,10 +322,6 @@ impl Handler {
             }
         }
         
-        info!("no arp entry found for src_ip {:?} dst_ip {:?}", src_ip, dst_ip);
-        
-
-        info!("checking routes");
         let vrf = if let Some(vrf) = self.network_state_client.get_vrf_from_ifidx(ifidx).await{
             Some(vrf)
         } else if let Some(intf) = self.network_state_client.get_interface(ifidx).await{
@@ -338,8 +331,8 @@ impl Handler {
                 } else { None }
             } else { None }
         } else { None };
+
         if let Some(vrf) = vrf{
-            info!("vrf: {:?}", vrf);
             let routes = self.network_state_client.get_routes(u32::from_be_bytes(dst_ip.octets()), vrf).await;
             let next_hop_count = routes.len() as u32;
             let mut ret = None;
@@ -386,9 +379,7 @@ impl Handler {
             };
 
             for (idx, (gateway_ip, oif_idx, mac)) in routes.iter().enumerate(){
-                info!("gateway_ip: {:?}, oif_idx: {:?}, mac: {:?}", Ipv4Addr::from(*gateway_ip), oif_idx, MacAddr::from(*mac));
                 if let Some(gateway_mac) = self.network_state_client.get_gateway_mac_from_prefix(*gateway_ip).await{
-                    info!("gateway_mac: {:?}", MacAddr::from(gateway_mac));
                     eth_packet.set_destination(gateway_mac.into());
                     eth_packet.set_source(mac.clone().into());
                     let fwd_flow_next_hop = FlowNextHop{
@@ -400,7 +391,7 @@ impl Handler {
                         next_hop_idx: idx as u32,
                         packet_count: 0,
                         active_next_hop: 0,
-                        max_packets: 100,
+                        max_packets: 1000000,
                     };
                     fwd_rev_flow.as_mut().unwrap().fwd.next_hops.push(fwd_flow_next_hop);
                     ret = Some(vec![(*oif_idx, queue_id)]);
@@ -412,8 +403,10 @@ impl Handler {
                 self.flow_manager_client.add_flow(fwd_rev_flow).await.
                     unwrap_or_else(|e| error!("Failed to add flow: {}", e));
                 if let Ok(res) = self.flow_manager_client.get_ifidx_queue(fwd_flow_key).await{
-                    if let Some((ifidx, queue_id)) = res{
-                        return Some(vec![(ifidx, queue_id)]);
+                    if let Some(flow_next_hop) = res{
+                        //eth_packet.set_destination(flow_next_hop.dst_mac.into());
+                        //eth_packet.set_source(flow_next_hop.src_mac.into());
+                        return Some(vec![(flow_next_hop.ifidx, flow_next_hop.queue_id)]);
                     }
                 } else if ret.is_some(){
                     return ret
@@ -423,15 +416,13 @@ impl Handler {
             }
 
             let bridges = self.network_state_client.get_bridges_from_vrf(vrf).await;
+            info!("checking bridge for src_ip {:?} dst_ip {:?}", src_ip, dst_ip);
             for bridge in &bridges{
                 for (prefix, prefix_len) in &bridge.ips{
                     let net = IpNetwork::new(IpAddr::V4(Ipv4Addr::from(*prefix)), *prefix_len).unwrap();
                     if net.contains(IpAddr::V4(Ipv4Addr::from(dst_ip))){
-                        info!("found bridge {:?} for dst_ip: {:?} with interfaces: {:?}",bridge, dst_ip, bridge.interfaces);
                         for interface in &bridge.interfaces{
-                            info!("intf: {:?}", interface);
                             if let Some(dst_mac) = self.network_state_client.send_arp_request(u32::from_be_bytes(dst_ip.octets()), bridge.mac, *prefix, *interface).await{
-                                info!("dst_mac: {:?}", MacAddr::from(dst_mac));
                                 self.global_arp_table.lock().unwrap().insert(&u32::from_be_bytes(dst_ip.octets()), &ArpEntry{
                                     ifidx: *interface,
                                     smac: dst_mac,
@@ -439,6 +430,7 @@ impl Handler {
                                 }, 0).unwrap();
                                 eth_packet.set_destination(dst_mac.into());
                                 eth_packet.set_source(bridge.mac.into());
+                                info!("eth packet {:?}", eth_packet);
                                 if let Some((src_port, dst_port)) = src_dst_port{
 
                                     let fwd_flow_key = FlowKey{
@@ -498,15 +490,12 @@ impl Handler {
                                         unwrap_or_else(|e| error!("Failed to add flow: {}", e));
                                 }
                                 return Some(vec![(*interface, queue_id)]);
-                            } else {
-                                error!("dst_mac not found from arp request");
                             }
                         }
                     }
                 }
             }
         }
-        error!("no forwarind information found for dst_ip: {:?}", dst_ip);
         None
     }
 }

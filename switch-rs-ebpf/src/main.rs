@@ -102,6 +102,24 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
         }
         return Ok(xdp_action::XDP_PASS);
     }
+    
+    let queue = unsafe { (*ctx.ctx).rx_queue_index };
+    let queue_idx = match unsafe { INTERFACEQUEUETABLE.get(&InterfaceQueue::new(ingress_if_idx, queue))}{
+        Some(queue_idx) => queue_idx,
+        None => {
+            info!(&ctx,"failed to get queue index from INTERFACEQUEUETABLE {}/{}", ingress_if_idx, queue);
+            return Ok(xdp_action::XDP_ABORTED);
+        }
+    };
+    match unsafe { XSKMAP.redirect(*queue_idx, 0) }{
+        Ok(res) => {
+            return Ok(res);
+        },
+        Err(e) => {
+            info!(&ctx,"failed to redirect ARP request to queue {}: {}", queue, e);
+            return Ok(xdp_action::XDP_ABORTED);
+        }
+    }
 
     if unsafe { (*eth_hdr).ether_type } == EtherType::Ipv4 {
         let ipv4_hdr = match ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN){
@@ -157,7 +175,8 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                 }
                 let packet_count = unsafe { (*flow_next_hop).packet_count };
                 let max_packets = unsafe { (*flow_next_hop).max_packets };
-                if packet_count >= max_packets{
+                let next_hop_count = unsafe { (*flow_next_hop).next_hop_count };
+                if packet_count > max_packets && next_hop_count > 1{
                     let queue = unsafe { (*ctx.ctx).rx_queue_index };
                     let queue_idx = match unsafe { INTERFACEQUEUETABLE.get(&InterfaceQueue::new(ingress_if_idx, queue))}{
                         Some(queue_idx) => queue_idx,
@@ -176,7 +195,7 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                         }
                     }
                 } else {
-                    unsafe { (*flow_next_hop).packet_count += 1 };
+                    //unsafe { (*flow_next_hop).packet_count += 1 };
                     let ifidx = unsafe { (*flow_next_hop).ifidx };
                     let res = unsafe { bpf_redirect(ifidx, 0)};
                     return Ok(res as u32)

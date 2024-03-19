@@ -388,8 +388,7 @@ impl NetworkState{
             info!("Waiting for arp response");
             let buf = match rx.next(){
                 Ok(buf) => buf,
-                Err(e) => {
-                    error!("Error getting arp response: {}\n{:#?}\n{:#?}\n{:#?}", e, network_interface, ethernet_packet, arp_packet);
+                Err(_e) => {
                     return None;
                 }
             };
