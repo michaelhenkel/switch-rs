@@ -150,8 +150,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let mut flow_manager = FlowManager::new(flow_table_mutex.clone());
     let mut network_state = NetworkState::new(interface_list.clone(), interface_configuration_mutex);
-    let handler = handler::handler::Handler::new(interface_list.clone(), mac_table_mutex, arp_table_mutex, flow_table_mutex.clone(), network_state.client(), flow_manager.client(), );
-    let afxdp = AfXdp::new(interface_list.clone(), xsk_map, interface_queue_table);
+    let handler = handler::handler::Handler::new(interface_list.clone(), mac_table_mutex.clone(), arp_table_mutex, flow_table_mutex.clone(), network_state.client(), flow_manager.client(), );
+    let afxdp = AfXdp::new(interface_list.clone(), xsk_map, interface_queue_table, mac_table_mutex.clone());
     let mut jh_list = Vec::new();
     let handler_clone = handler.clone();
 

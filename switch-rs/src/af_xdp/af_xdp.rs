@@ -2,6 +2,7 @@ use core::{num::NonZeroU32, ptr::NonNull};
 use std::{cell::UnsafeCell, collections::{HashMap, VecDeque},sync::{Arc, Mutex}, time::Duration};
 use anyhow::anyhow;
 use async_trait::async_trait;
+use pnet::packet::{arp::{ArpOperations, ArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, Packet};
 use switch_rs_common::InterfaceQueue;
 use tokio::sync::{RwLock, RwLockWriteGuard};
 use xdpilone::{xdp::XdpDesc, DeviceQueue, RingRx, RingTx, WriteFill};
@@ -99,6 +100,7 @@ pub struct AfXdp{
     interface_list: HashMap<u32, Interface>,
     xsk_map: Arc<Mutex<XskMap<MapData>>>,
     interface_queue_table: Arc<Mutex<BpfHashMap<MapData, InterfaceQueue, u32>>>,
+    mac_table: BpfHashMap<MapData, [u8;6], u32>,
 }
 
 impl AfXdp{
@@ -106,6 +108,7 @@ impl AfXdp{
         interface_list: HashMap<u32, Interface>,
         xsk_map: XskMap<MapData>,
         interface_queue_table: BpfHashMap<MapData, InterfaceQueue, u32>,
+        mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
     ) -> Self{
         let mut rx_map = HashMap::new();
         let mut tx_map = HashMap::new();
@@ -127,6 +130,7 @@ impl AfXdp{
             interface_list,
             xsk_map: Arc::new(Mutex::new(xsk_map)),
             interface_queue_table: Arc::new(Mutex::new(interface_queue_table)),
+            mac_table,
         }
     }
     pub async fn run<'a>(&self, handler: impl PacketHandler + 'static + Send + Sync + Clone) -> anyhow::Result<()>{
@@ -134,6 +138,7 @@ impl AfXdp{
             self.interface_list.clone(), 
             self.xsk_map.clone(), 
             self.interface_queue_table.clone(),
+            self.mac_table.clone(),
         );
         queue_manager.run(handler).await.unwrap();
         Ok(())
@@ -161,6 +166,7 @@ struct QueueManager{
     xsk_map: Arc<Mutex<XskMap<MapData>>>,
     interface_queue_table: Arc<Mutex<BpfHashMap<MapData, InterfaceQueue, u32>>>,
     interface_list: HashMap<u32, Interface>,
+    mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
 }
 
 impl QueueManager{
@@ -168,11 +174,13 @@ impl QueueManager{
         interface_list: HashMap<u32, Interface>,
         xsk_map: Arc<Mutex<XskMap<MapData>>>,
         interface_queue_table: Arc<Mutex<BpfHashMap<MapData, InterfaceQueue, u32>>>,
+        mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
     ) -> Self{
         QueueManager{
             xsk_map,
             interface_queue_table,
             interface_list,
+            mac_table
         }
     }
     pub async fn run(&mut self, handler: impl PacketHandler + 'static + Send + Sync + Clone) -> anyhow::Result<()>{
@@ -285,9 +293,10 @@ impl QueueManager{
             let ring_tx_map = ring_tx_map.clone();
             queue.complete_counter_map = complete_counter_map.clone();
             queue.complete_address_list = complete_address_list.clone();
+            let mac_table = self.mac_table.clone();
             let handler_clone = handler.clone(); // Clone the handler variable
             let jh = tokio::spawn(async move{
-                queue.run(frame_buffer, ring_rx, ring_tx_map, handler_clone).await.unwrap();
+                queue.run(frame_buffer, ring_rx, ring_tx_map, handler_clone, mac_table).await.unwrap();
             });
             jh_list.push(jh);
         }
@@ -345,6 +354,7 @@ impl Queue{
         mut ring_rx: RingRx,
         ring_tx_map: HashMap<(u32,u32), Arc<Mutex<RingTx>>>,
         mut handler: impl PacketHandler + 'static + Send + Sync + Clone,
+        mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
     ) -> anyhow::Result<()> {
         let mut jh_list = Vec::new();
 
@@ -388,7 +398,8 @@ impl Queue{
             }
             let mut fill_list = VecDeque::new();
             let mut idle_timer = tokio::time::Instant::now();
-
+            let mut local_mac_table: HashMap<[u8;6], u32> = HashMap::new();
+            let mac_table = mac_table.clone();
             loop{
                 receive_interval.tick().await;
 
@@ -421,6 +432,63 @@ impl Queue{
                     let buf_idx = (desc.addr / FRAME_SIZE as u64) * FRAME_SIZE as u64;
                     let offset = desc.addr - buf_idx;
 
+
+                    if let Some(buf) = frame_buffer.get_mut(&buf_idx) {
+                        let mut buf = &mut buf.as_mut()[offset as usize..];
+                        if let Some(eth_packet) = MutableEthernetPacket::new(&mut buf){
+                            match eth_packet.get_ethertype(){
+                                EtherTypes::Arp => {
+                                    if let Some(arp_packet) = ArpPacket::new(eth_packet.payload()){
+                                        let op = arp_packet.get_operation();
+                                        match op{
+                                            ArpOperations::Request => {
+                                                for (_, interface) in &interface_list{
+                                                    if interface.ifidx == ifidx{
+                                                        continue;
+                                                    }
+                                                    send_map.get_mut(&(interface.ifidx, queue_id)).unwrap().push_back(desc);
+                                                }  
+                                            },
+                                            _ => {},
+                                        }
+                                    } else {
+                                        fill_list.push_back(desc.addr);
+                                        error!("failed to parse arp packet");
+                                    }
+                                },
+                                
+                                EtherTypes::Ipv4 => {
+                                    let dst_mac: [u8;6] = eth_packet.get_destination().into();
+                                    let dst_ifidx = if let Some(dst_ifidx) = local_mac_table.get(&dst_mac){
+                                        *dst_ifidx
+                                    } else {
+                                        if let Ok(dst_ifidx) = mac_table.lock().unwrap().get(&dst_mac.into(),0){
+                                            local_mac_table.insert(dst_mac, dst_ifidx);
+                                            dst_ifidx
+                                        } else {
+                                            fill_list.push_back(desc.addr);
+                                            error!("failed to get dst ifidx");
+                                            continue;
+                                        }
+                                    };
+                                    send_map.get_mut(&(dst_ifidx, queue_id)).unwrap().push_back(desc);
+                                },
+                        
+                                _ => {
+                                    fill_list.push_back(desc.addr);
+                                    //error!("failed to parse packet, not arp or ipv4 {:#?}", eth_packet);
+                                }
+                            }
+                        } else {
+                            fill_list.push_back(desc.addr);
+                            error!("failed to parse ethernet packet");
+                        }
+                    } else {
+                        fill_list.push_back(desc.addr);
+                        error!("failed to get buffer for address {}", desc.addr);
+                    }
+
+                    /*
                     if let Some(buf) = frame_buffer.get_mut(&buf_idx) {
                         let mut buf = &mut buf.as_mut()[offset as usize..];
                         //let now = tokio::time::Instant::now();
@@ -436,6 +504,7 @@ impl Queue{
                         fill_list.push_back(desc.addr);
                         error!("failed to get buffer for address {}", desc.addr);
                     }
+                    */
                 }
 
                 if idle_timer.elapsed() > tokio::time::Duration::from_secs(2){
@@ -506,7 +575,7 @@ impl Queue{
                     
                     
                     let mut complete_fill_list: VecDeque<u64> = complete_list.lock().unwrap().drain(0..).collect();
-                    error!("{} 2 pending: {} threshold: {}, complete_fill_list: {}", queue_id_ifidx, pending_cnt, thresholds, complete_fill_list.len());
+                    //error!("{} 2 pending: {} threshold: {}, complete_fill_list: {}", queue_id_ifidx, pending_cnt, thresholds, complete_fill_list.len());
                     total_fill_list_counter += complete_fill_list.len();
                     loop{
                         let mut failed_list = VecDeque::new();
