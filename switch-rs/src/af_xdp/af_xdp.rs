@@ -1,10 +1,10 @@
 use core::{num::NonZeroU32, ptr::NonNull};
-use std::{cell::UnsafeCell, collections::{HashMap, VecDeque},sync::{Arc, Mutex}, time::Duration};
+use std::{cell::UnsafeCell, collections::{HashMap, VecDeque}, io, os::fd::{self, RawFd}, sync::{Arc, Mutex}, time::Duration};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use pnet::packet::{arp::{ArpOperations, ArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, Packet};
 use switch_rs_common::InterfaceQueue;
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::{io::unix::AsyncFd, sync::{RwLock, RwLockWriteGuard}};
 use xdpilone::{xdp::XdpDesc, DeviceQueue, RingRx, RingTx, WriteFill};
 use aya::maps::{HashMap as BpfHashMap, MapData, XskMap};
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
@@ -19,7 +19,7 @@ const HEADROOM: u32 = 1 << 8;
 const BUFFER_SIZE: u32 = 1 << 24;
 const THRESOLD_FACTOR: u32 = 8;
 const RX_INTERVAL: u64 = 50;
-const COMPLETE_INTERVAL: u64 = 10;
+const COMPLETE_INTERVAL: u64 = 1000;
 #[repr(align(4096))]
 struct PacketMap(UnsafeCell<[u8; BUFFER_SIZE as usize]>);
 
@@ -371,9 +371,9 @@ impl Queue{
 
         let fq_cq_clone = self.fq_cq.clone();
         let complete_list = self.complete_list.clone();
-
+        
         let jh = tokio::spawn(async move{
-            let mut receive_interval = tokio::time::interval(Duration::from_nanos(RX_INTERVAL));
+            
             //let mut pending_now = tokio::time::Instant::now();
             let mut receive_counter = 0;
             let mut total_sent_counter = 0;
@@ -389,11 +389,9 @@ impl Queue{
             }
             let mut fill_list = VecDeque::new();
             let mut idle_timer = tokio::time::Instant::now();
-            let mut local_mac_table: HashMap<[u8;6], u32> = HashMap::new();
-
+            let fd = ring_rx.as_raw_fd();
             loop{
-                receive_interval.tick().await;
-
+                wait(fd).await.unwrap();
                 let mut fq_cq = fq_cq_clone.write().await;
                 if receive_counter > thresholds{
                     let mut complete_fill_list: VecDeque<u64> = complete_list.lock().unwrap().drain(0..).collect();
@@ -597,4 +595,13 @@ fn pending(fq_cq: &mut RwLockWriteGuard<'_, MyDeviceQueue>) -> anyhow::Result<u3
 #[async_trait]
 pub trait PacketHandler: Send + Sync + Clone{
     async fn handle_packet(&mut self, buf: &mut [u8], ifidx: u32, queue_id: u32) -> Option<Vec<(u32, u32)>>;
+}
+
+pub async fn wait(fd: RawFd) -> io::Result<()> {
+    let async_fd = AsyncFd::new(fd)?;
+    let mut guard = async_fd.readable().await.expect("failed to wait for fd to be readable");
+    let _ = guard.try_io(|_| {
+        Ok(())
+    });
+    Ok(())
 }

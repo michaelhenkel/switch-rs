@@ -506,7 +506,7 @@ impl Handler {
                 }
             }
         }
-        error!("no forwarind information found for dst_ip: {:?}", dst_ip);
+        error!("no forwarding information found for dst_ip: {:?}", dst_ip);
         None
     }
 }
