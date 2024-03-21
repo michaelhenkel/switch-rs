@@ -155,37 +155,18 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                     unsafe { (*eth_hdr).src_addr[i] = (*flow_next_hop).src_mac[i] };
                     unsafe { (*eth_hdr).dst_addr[i] = (*flow_next_hop).dst_mac[i] };
                 }
-                let packet_count = unsafe { (*flow_next_hop).packet_count };
-                let max_packets = unsafe { (*flow_next_hop).max_packets };
-                if packet_count >= max_packets{
-                    let queue = unsafe { (*ctx.ctx).rx_queue_index };
-                    let queue_idx = match unsafe { INTERFACEQUEUETABLE.get(&InterfaceQueue::new(ingress_if_idx, queue))}{
-                        Some(queue_idx) => queue_idx,
-                        None => {
-                            info!(&ctx,"failed to get queue index from INTERFACEQUEUETABLE {}/{}", ingress_if_idx, queue);
-                            return Ok(xdp_action::XDP_ABORTED);
-                        }
-                    };
-                    match unsafe { XSKMAP.redirect(*queue_idx, 0) }{
-                        Ok(res) => {
-                            return Ok(res);
-                        },
-                        Err(e) => {
-                            info!(&ctx,"failed to redirect ARP request to queue {}: {}", queue, e);
-                            return Ok(xdp_action::XDP_ABORTED);
-                        }
-                    }
-                } else {
-                    unsafe { (*flow_next_hop).packet_count += 1 };
-                    let ifidx = unsafe { (*flow_next_hop).ifidx };
-                    let res = unsafe { bpf_redirect(ifidx, 0)};
-                    return Ok(res as u32)
-                }
+                unsafe { (*flow_next_hop).packet_count += 1 };
+                let ifidx = unsafe { (*flow_next_hop).ifidx };
+                let res = unsafe { bpf_redirect(ifidx, 0)};
+                return Ok(res as u32)
+                
             }
         }
     }
     
+    return Ok(xdp_action::XDP_PASS);
     
+    /*
     let queue = unsafe { (*ctx.ctx).rx_queue_index };
     let queue_idx = match unsafe { INTERFACEQUEUETABLE.get(&InterfaceQueue::new(ingress_if_idx, queue))}{
         Some(queue_idx) => queue_idx,
@@ -203,6 +184,7 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
             Ok(xdp_action::XDP_ABORTED)
         }
     }
+    */
     
     
     
