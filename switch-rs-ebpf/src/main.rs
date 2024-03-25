@@ -178,7 +178,7 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                     unsafe { (*eth_hdr).dst_addr[i] = (*flow_next_hop).dst_mac[i] };
                 }
                 unsafe { (*flow_next_hop).packet_count += 1 };
-                let ifidx = unsafe { (*flow_next_hop).ifidx };
+                let ifidx = unsafe { (*flow_next_hop).oif_idx };
                 unsafe { INTERFACESTATS.get_ptr_mut(&ifidx) }.map(|interface_stats|{
                     unsafe { (*interface_stats).tx_packets += 1 };
                 });

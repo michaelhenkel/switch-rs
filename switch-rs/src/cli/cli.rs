@@ -55,14 +55,18 @@ async fn cli(client: FlowManagerClient) -> anyhow::Result<()> {
                     match cli_item{
                         CliItem::Stats => {
                             let stats = client.list_stats().await.unwrap();
-                            for (ifidx, stats) in stats.iter(){
+                            let mut stats_list = stats.iter().collect::<Vec<_>>();
+                            stats_list.sort_by_key(|(ifidx, _)| *ifidx);
+                            for (ifidx, stats) in stats_list.iter(){
                                 println!("Interface {} {}", ifidx, stats);
                             }
                         },
                         CliItem::Flows => {
                             let flows = client.list_flows().await.unwrap();
-                            for (flow_key, flow) in flows.iter(){
-                                println!("Flow {} {}", display_flow_key(flow_key), display_flow_next_hop(flow));
+                            let mut flows_list = flows.iter().collect::<Vec<_>>();
+                            flows_list.sort_by_key(|(flow_key, _)| *flow_key);
+                            for (flow_key, (flow, last_updated)) in flows.iter(){
+                                println!("Flow {} {}", display_flow_key(flow_key), display_flow_next_hop(flow, last_updated));
                             }
                         }
                     }
@@ -130,15 +134,16 @@ fn display_flow_key(flow_key: &FlowKey) -> String {
         src_ip, src_port, dst_ip, dst_port)
 }
 
-fn display_flow_next_hop(flow_next_hop: &FlowNextHop) -> String {
+fn display_flow_next_hop(flow_next_hop: &FlowNextHop, last_updated: &tokio::time::Instant) -> String {
     let src_mac = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         flow_next_hop.src_mac[0], flow_next_hop.src_mac[1], flow_next_hop.src_mac[2],
         flow_next_hop.src_mac[3], flow_next_hop.src_mac[4], flow_next_hop.src_mac[5]);
     let dst_mac = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         flow_next_hop.dst_mac[0], flow_next_hop.dst_mac[1], flow_next_hop.dst_mac[2],
         flow_next_hop.dst_mac[3], flow_next_hop.dst_mac[4], flow_next_hop.dst_mac[5]);
-    let oif = flow_next_hop.ifidx;
+    let oif = flow_next_hop.oif_idx;
     let packets = flow_next_hop.packet_count;
-    format!("src_mac {} dst_mac {} oif {} packets {}",
-        src_mac, dst_mac, oif, packets)
+    let last_updated = last_updated.elapsed().as_secs();
+    format!("src_mac {} dst_mac {} oif {} packets {}, last_updated {}s ago",
+        src_mac, dst_mac, oif, packets, last_updated)
 }

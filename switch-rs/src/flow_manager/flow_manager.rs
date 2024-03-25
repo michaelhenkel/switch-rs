@@ -31,71 +31,44 @@ impl FlowManager{
                     cmd = rx.recv() => {
                         if let Some(cmd) = cmd{
                             match cmd{
-                                FlowCommand::AddFlow { fwd_rev_flow, ifidx } => {
-                                    let fwd_flow = fwd_rev_flow.fwd;
-                                    let rev_flow = fwd_rev_flow.rev;
-                                    let fwd_key = fwd_flow.key;
-                                    let rev_key = rev_flow.key;
-                                    let mut fwd_next_hops = fwd_flow.next_hops;
-                                    let mut rev_next_hops = rev_flow.next_hops;
-                                    if fwd_next_hops.is_empty() || rev_next_hops.is_empty(){
+                                FlowCommand::AddFlow { flow, ifidx } => {
+
+                                    let flow_key = flow.key;
+                                    let mut flow_next_hops = flow.next_hops;
+                                    if flow_next_hops.is_empty(){
                                         continue;
                                     }
 
-                                    let mut fwd_nh_ranked_list = Vec::new();
-                                    for next_hop in &fwd_next_hops{
-                                        let iface_stats = interface_stats.get(&next_hop.ifidx, 0).unwrap();
-                                        info!("iface_stats: {} {:?}",next_hop.ifidx, iface_stats);
-                                        fwd_nh_ranked_list.push((iface_stats.flows, next_hop.clone()));
+                                    let mut nh_ranked_list = Vec::new();
+                                    for next_hop in &flow_next_hops{
+                                        let iface_stats = interface_stats.get(&next_hop.oif_idx, 0).unwrap();
+                                        nh_ranked_list.push((iface_stats.flows, next_hop.clone()));
                                     }
-                                    fwd_nh_ranked_list.sort_by(|a,b|a.0.cmp(&b.0));
+                                    nh_ranked_list.sort_by(|a,b|a.0.cmp(&b.0));
 
-                                    fwd_next_hops = fwd_nh_ranked_list.into_iter().map(|(_, v)| v).collect();
-                                    info!("fwd_next_hops: {:?}", fwd_next_hops);
-
-                                    let mut fwd_nh_ranked_list = Vec::new();
-                                    for next_hop in &rev_next_hops{
-                                        let iface_stats = interface_stats.get(&next_hop.ifidx, 0).unwrap();
-                                        fwd_nh_ranked_list.push((iface_stats.flows, next_hop.clone()));
-                                    }
-                                    rev_next_hops = fwd_nh_ranked_list.into_iter().map(|(_, v)| v).collect();
+                                    flow_next_hops = nh_ranked_list.into_iter().map(|(_, v)| v).collect();
 
 
-                                    for nh in &mut fwd_next_hops{
+
+                                    for nh in &mut flow_next_hops{
                                         nh.active_next_hop = 0;
                                     }
                                     let now = tokio::time::Instant::now();
-                                    local_flow_table.insert(fwd_key, LocalNextHop{next_hop_list: fwd_next_hops.clone(), last_updated: now, packet_count: 0});
-                                    //local_flow_table.insert(rev_key, LocalNextHop{next_hop_list: rev_next_hops.clone(), last_updated: now, packet_count: 0});
-                                    info!("using next hop: {:?}", fwd_next_hops[0]);
-                                    if let Err(e) = global_flow_table.insert(fwd_key, fwd_next_hops[0],0){
+                                    local_flow_table.insert(flow_key, LocalNextHop{next_hop_list: flow_next_hops.clone(), last_updated: now, packet_count: 0});
+
+                                    if let Err(e) = global_flow_table.insert(flow_key, flow_next_hops[0],0){
                                         log::error!("Failed to insert flow into global flow table: {}", e);
                                     }
-                                    if let Err(e) = global_flow_table.insert(rev_key, rev_next_hops[0],0){
-                                        log::error!("Failed to insert flow into global flow table: {}", e);
-                                    }
-                                    if let Ok(mut stats) = interface_stats.get(&fwd_next_hops[0].ifidx, 0){
-                                        info!("incrementing flows for interface {}", fwd_next_hops[0].ifidx);
+
+                                    if let Ok(mut stats) = interface_stats.get(&flow_next_hops[0].oif_idx, 0){
                                         stats.flows += 1;
-                                        interface_stats.insert(&fwd_next_hops[0].ifidx, stats, 0).unwrap();
+                                        interface_stats.insert(&flow_next_hops[0].oif_idx, stats, 0).unwrap();
                                     }
-                                    if let Ok(mut stats) = interface_stats.get(&ifidx, 0){
-                                        info!("incrementing flows for interface {}", fwd_next_hops[0].ifidx);
-                                        stats.flows += 1;
-                                        interface_stats.insert(&ifidx, stats, 0).unwrap();
-                                    }
-                                    /*
-                                    if let Ok(mut stats) = interface_stats.get(&rev_next_hops[0].ifidx, 0){
-                                        info!("incrementing flows for interface {}", rev_next_hops[0].ifidx);
-                                        stats.flows += 1;
-                                        interface_stats.insert(&rev_next_hops[0].ifidx, stats, 0).unwrap();
-                                    }
-                                    */
                                 },
                                 FlowCommand::GetIfidxQueue { flow_key, tx } => {
                                     let active_flow = global_flow_table.get(&flow_key, 0).ok();
                                     let res = if let Some(active_flow) = active_flow{
-                                        Some((active_flow.ifidx, active_flow.queue_id))
+                                        Some((active_flow.oif_idx, active_flow.queue_id))
                                     } else {
                                         None
                                     };
@@ -121,7 +94,10 @@ impl FlowManager{
                                     let mut flow_map = HashMap::new();
                                     for res in global_flow_table.iter(){
                                         if let Ok((flow_key, flow_next_hop)) = res{
-                                            flow_map.insert(flow_key.clone(), flow_next_hop.clone());
+                                            if let Some(local_next_hop) = local_flow_table.get(&flow_key){
+                                                flow_map.insert(flow_key.clone(), (flow_next_hop.clone(), local_next_hop.last_updated));
+                                            }
+                                            
                                         }
                                     }
                                     let _ = tx.send(flow_map);
@@ -130,6 +106,12 @@ impl FlowManager{
                                     if let Ok(mut stats) = interface_stats.get(&ifidx, 0){
                                         stats.tx_packets += 1;
                                         interface_stats.insert(&ifidx, stats, 0).unwrap();
+                                    }
+                                },
+                                FlowCommand::IncrFlowPacketCount { flow_key } => {
+                                    if let Ok(mut flow) = global_flow_table.get(&flow_key, 0){
+                                        flow.packet_count += 1;
+                                        let _ = global_flow_table.insert(flow_key, flow, 0);
                                     }
                                 },
                             }
@@ -141,8 +123,8 @@ impl FlowManager{
                             let flow_list = &local_next_hop.next_hop_list;
                             if let Ok(active_flow) = global_flow_table.get(flow_key, 0){
                                 let now = tokio::time::Instant::now();
-                                if now.duration_since(local_next_hop.last_updated).as_secs() > 300 && active_flow.packet_count == local_next_hop.packet_count{
-                                    inactive_flows.push((flow_key.clone(), active_flow.ifidx));
+                                if now.duration_since(local_next_hop.last_updated).as_secs() > 30 && active_flow.packet_count == local_next_hop.packet_count{
+                                    inactive_flows.push((flow_key.clone(), active_flow.oif_idx));
                                     continue;
                                 }
                                 if active_flow.packet_count > local_next_hop.packet_count{
@@ -152,9 +134,9 @@ impl FlowManager{
                                 let dur = now.duration_since(local_next_hop.last_updated).as_millis() as u64;
                                 if packet_rate > 0 && dur > 0{
                                     let packet_rate = packet_rate / dur;
-                                    if let Ok(mut stats) = interface_stats.get(&active_flow.ifidx, 0){
+                                    if let Ok(mut stats) = interface_stats.get(&active_flow.oif_idx, 0){
                                         stats.rate = packet_rate;
-                                        interface_stats.insert(&active_flow.ifidx, stats, 0).unwrap();
+                                        interface_stats.insert(&active_flow.oif_idx, stats, 0).unwrap();
                                     }
                                 }
                                 local_next_hop.packet_count = active_flow.packet_count;
@@ -166,17 +148,17 @@ impl FlowManager{
                                         next_active_next_hop.active_next_hop = next_active_next_hop_index;
                                         next_active_next_hop.packet_count = 0;
                                         let _ = global_flow_table.insert(flow_key, next_active_next_hop, 0);
-                                        if let Ok(mut stats) = interface_stats.get(&active_flow.ifidx, 0){
+                                        if let Ok(mut stats) = interface_stats.get(&active_flow.oif_idx, 0){
                                             if stats.flows > 0{
-                                                info!("decrementing flows for interface {}", active_flow.ifidx);
+                                                info!("decrementing flows for interface {}", active_flow.oif_idx);
                                                 stats.flows -= 1;
-                                                interface_stats.insert(&active_flow.ifidx, stats, 0).unwrap();
+                                                interface_stats.insert(&active_flow.oif_idx, stats, 0).unwrap();
                                             }
                                         }
-                                        if let Ok(mut stats) = interface_stats.get(&next_active_next_hop.ifidx, 0){
-                                            info!("incrementing 2 flows for interface {}", next_active_next_hop.ifidx);
+                                        if let Ok(mut stats) = interface_stats.get(&next_active_next_hop.oif_idx, 0){
+                                            info!("incrementing 2 flows for interface {}", next_active_next_hop.oif_idx);
                                             stats.flows += 1;
-                                            interface_stats.insert(&next_active_next_hop.ifidx, stats, 0).unwrap();
+                                            interface_stats.insert(&next_active_next_hop.oif_idx, stats, 0).unwrap();
                                         }
                                     }
                                 }
@@ -232,8 +214,8 @@ impl FlowManagerClient{
     pub fn new(tx: tokio::sync::mpsc::Sender<FlowCommand>) -> Self{
         FlowManagerClient{tx}
     }
-    pub async fn add_flow(&self, fwd_rev_flow: FwdRevFlow, ifidx: u32) -> anyhow::Result<()>{
-        self.tx.send(FlowCommand::AddFlow{fwd_rev_flow, ifidx}).await.
+    pub async fn add_flow(&self, flow: Flow, ifidx: u32) -> anyhow::Result<()>{
+        self.tx.send(FlowCommand::AddFlow{flow, ifidx}).await.
             map_err(|e| anyhow::anyhow!("Failed to send add flow command: {}", e))
     }
     pub async fn get_ifidx_queue(&self, flow_key: FlowKey) -> anyhow::Result<Option<(u32, u32)>>{
@@ -255,7 +237,7 @@ impl FlowManagerClient{
         self.tx.send(FlowCommand::UpdateInterfaceConfiguration{ifidx, interface_configuration}).await.
             map_err(|e| anyhow::anyhow!("Failed to send update interface configuration command: {}", e))
     }
-    pub async fn list_flows(&self) -> anyhow::Result<HashMap<FlowKey, FlowNextHop>>{
+    pub async fn list_flows(&self) -> anyhow::Result<HashMap<FlowKey, (FlowNextHop, tokio::time::Instant)>>{
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.tx.send(FlowCommand::ListFlows{tx}).await;
         rx.await.map_err(|e| anyhow::anyhow!("Failed to list flows: {}", e))
@@ -264,12 +246,16 @@ impl FlowManagerClient{
         self.tx.send(FlowCommand::IncrStatsPacketCount{ifidx}).await.
             map_err(|e| anyhow::anyhow!("Failed to send increment stats packet count command: {}", e))
     }
+    pub async fn incr_flow_packet_count(&self, flow_key: FlowKey) -> anyhow::Result<()>{
+        self.tx.send(FlowCommand::IncrFlowPacketCount{flow_key}).await.
+            map_err(|e| anyhow::anyhow!("Failed to send increment flow packet count command: {}", e))
+    }
 }
 
 pub enum FlowCommand{
     AddFlow{
         ifidx: u32,
-        fwd_rev_flow: FwdRevFlow,
+        flow: Flow,
     },
     GetIfidxQueue{
         flow_key: FlowKey,
@@ -287,10 +273,13 @@ pub enum FlowCommand{
         interface_configuration: InterfaceConfiguration,
     },
     ListFlows{
-        tx: tokio::sync::oneshot::Sender<HashMap<FlowKey, FlowNextHop>>,
+        tx: tokio::sync::oneshot::Sender<HashMap<FlowKey, (FlowNextHop, tokio::time::Instant)>>,
     },
     IncrStatsPacketCount{
         ifidx: u32,
+    },
+    IncrFlowPacketCount{
+        flow_key: FlowKey,
     },
 }
 
@@ -298,10 +287,4 @@ pub enum FlowCommand{
 pub struct Flow{
     pub key: FlowKey,
     pub next_hops: Vec<FlowNextHop>,
-}
-
-#[derive(Default)]
-pub struct FwdRevFlow{
-    pub fwd: Flow,
-    pub rev: Flow,
 }
