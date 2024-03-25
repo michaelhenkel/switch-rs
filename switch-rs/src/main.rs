@@ -9,12 +9,13 @@ use clap::Parser;
 use env_logger::fmt;
 use log::{debug, info, warn};
 use tokio::signal;
-use switch_rs_common::{ArpEntry, FlowKey, FlowNextHop, InterfaceConfig, InterfaceConfiguration, InterfaceQueue};
+use switch_rs_common::{ArpEntry, FlowKey, FlowNextHop, InterfaceConfig, InterfaceConfiguration, InterfaceQueue, InterfaceStats};
 use af_xdp::{
     interface::interface::{get_interface_index, get_interface_mac},
     af_xdp::AfXdp,
 };
 use crate::af_xdp::interface::interface::Interface;
+use crate::cli::cli::Cli;
 use crate::network_state::network_state::NetworkState;
 use crate::flow_manager::flow_manager::FlowManager;
 
@@ -130,7 +131,7 @@ async fn main() -> Result<(), anyhow::Error> {
     };
 
     let arp_table = if let Some(arp_table) = bpf.take_map("ARPTABLE"){
-        let arp_table: BpfHashMap<MapData, u32, ArpEntry> = BpfHashMap::try_from(arp_table).unwrap();
+        let arp_table: BpfHashMap<MapData, [u8;4], ArpEntry> = BpfHashMap::try_from(arp_table).unwrap();
         arp_table
     } else {
         panic!("ARPTABLE map not found");
@@ -143,19 +144,33 @@ async fn main() -> Result<(), anyhow::Error> {
         panic!("INTERFACECONFIGURATION map not found");
     };
 
+    let mut interface_stats = if let Some(interface_stats) = bpf.take_map("INTERFACESTATS"){
+        let interface_stats: BpfHashMap<MapData, u32, InterfaceStats> = BpfHashMap::try_from(interface_stats).unwrap();
+        interface_stats
+    } else {
+        panic!("INTERFACESTATS map not found");
+    };
+
+    for (ifidx, _) in &interface_list{
+        if let Err(e) = interface_stats.insert(ifidx, InterfaceStats{rx_packets: 0, tx_packets: 0, flows: 0, rate: 0}, 0){
+            panic!("Failed to insert interface stats into map: {}", e);
+        }
+    }
+
     let mac_table_mutex = Arc::new(Mutex::new(mac_table));
     let arp_table_mutex = Arc::new(Mutex::new(arp_table));
     let interface_configuration_mutex = Arc::new(Mutex::new(interface_configuration));
 
     let mut flow_manager = FlowManager::new();
-    let mut network_state = NetworkState::new(interface_list.clone(), interface_configuration_mutex);
+    let mut network_state = NetworkState::new(interface_list.clone(), interface_configuration_mutex.clone());
     let handler = handler::handler::Handler::new(interface_list.clone(), mac_table_mutex, arp_table_mutex, network_state.client(), flow_manager.client());
     let afxdp = AfXdp::new(interface_list.clone(), xsk_map, interface_queue_table);
+    let cli = Cli::new(flow_manager.client());
     let mut jh_list = Vec::new();
     let handler_clone = handler.clone();
 
     let jh = tokio::spawn(async move {
-        flow_manager.run(flow_table).await;
+        flow_manager.run(flow_table, interface_stats, interface_configuration_mutex).await;
     });
     jh_list.push(jh);
     let jh = tokio::spawn(async move {
@@ -163,9 +178,12 @@ async fn main() -> Result<(), anyhow::Error> {
     });
     jh_list.push(jh);
 
-
     let jh = tokio::spawn(async move {
         afxdp.run(handler_clone).await.unwrap();
+    });
+    jh_list.push(jh);
+    let jh = tokio::spawn(async move {
+        cli.run().await.unwrap();
     });
     jh_list.push(jh);
     

@@ -2,7 +2,7 @@ use std::{collections::{HashMap, HashSet}, fmt::Display, net::{IpAddr, Ipv4Addr}
 
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use futures::TryStreamExt;
-use log::{info, error};
+use log::info;
 use netlink_packet_route::{address, link::{InfoBridgePort, InfoPortData, InfoPortKind, LinkAttribute, LinkInfo}, route::{RouteAddress, RouteAttribute}, AddressFamily};
 use pnet::{datalink::{self, Channel, Config, NetworkInterface}, packet::{arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, Packet}, util::MacAddr};
 use rtnetlink::{new_connection, IpVersion};
@@ -343,8 +343,7 @@ impl NetworkState{
         (vrf_routes, gateway_oif)
     }
     fn print_route_table(&self){
-        for (vrf, route_map) in &self.state.routes{
-            info!("VRF: {}", vrf);
+        for (_, route_map) in &self.state.routes{
             info!("{}", route_map);
         }
     }
@@ -375,7 +374,7 @@ impl NetworkState{
         ethernet_packet.set_payload(arp_packet.packet_mut());
     
         let mut configuration = Config::default();
-        configuration.read_timeout = Some(std::time::Duration::from_secs(2));
+        configuration.read_timeout = Some(std::time::Duration::from_millis(10));
         let (mut tx, mut rx) = match datalink::channel(&network_interface, configuration) {
             Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
             Ok(_) => panic!("Unknown channel type"),
@@ -388,8 +387,7 @@ impl NetworkState{
             info!("Waiting for arp response");
             let buf = match rx.next(){
                 Ok(buf) => buf,
-                Err(e) => {
-                    error!("Error getting arp response: {}\n{:#?}\n{:#?}\n{:#?}", e, network_interface, ethernet_packet, arp_packet);
+                Err(_e) => {
                     return None;
                 }
             };

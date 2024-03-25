@@ -1,6 +1,6 @@
 #![no_std]
 
-use core::mem;
+use core::{fmt::Display, mem};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -59,6 +59,7 @@ pub struct FlowKey{
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FlowKey {}
 
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FlowNextHop{
@@ -68,9 +69,9 @@ pub struct FlowNextHop{
     pub dst_mac: [u8;6],
     pub next_hop_count: u32,
     pub next_hop_idx: u32,
-    pub packet_count: u32,
+    pub packet_count: u64,
     pub active_next_hop: u32,
-    pub max_packets: u32,
+    pub max_packets: u64,
 }
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FlowNextHop {}
@@ -92,6 +93,33 @@ pub struct InterfaceConfiguration{
     pub bridge_id: [u8;6],
     pub l2: u8,
     pub pad: u8,
+    pub max_packets: u32,
 }
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for InterfaceConfiguration {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InterfaceStats{
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    pub flows: u64,
+    pub rate: u64,
+}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for InterfaceStats {}
+
+#[cfg(feature = "user")]
+impl Display for InterfaceStats {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "rx_packets: {}, tx_packet: {}, flows: {}, rate: {}", self.rx_packets, self.tx_packets, self.flows, self.rate)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetaData{
+    pub content: [u8;0],
+}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for MetaData {}

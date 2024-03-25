@@ -15,7 +15,7 @@ pub struct Handler{
     interface_list: HashMap<u32, Interface>,
     local_mac_table: HashMap<[u8;6], u32>,
     global_mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
-    global_arp_table: Arc<Mutex<BpfHashMap<MapData, u32, ArpEntry>>>,
+    global_arp_table: Arc<Mutex<BpfHashMap<MapData, [u8;4], ArpEntry>>>,
     network_state_client: NetworkStateClient,
     flow_manager_client: FlowManagerClient,
 }
@@ -32,7 +32,7 @@ impl PacketHandler for Handler {
                     return self.ipv4_handler(&mut eth_packet, queue_id, ifidx).await;
                 },
                 _ => {
-                    error!("ethertype not supported");
+                    
                 }
             }
         }
@@ -43,7 +43,7 @@ impl PacketHandler for Handler {
 impl Handler {
     pub fn new(interface_list: HashMap<u32, Interface>,
         global_mac_table: Arc<Mutex<BpfHashMap<MapData, [u8;6], u32>>>,
-        global_arp_table: Arc<Mutex<BpfHashMap<MapData, u32, ArpEntry>>>,
+        global_arp_table: Arc<Mutex<BpfHashMap<MapData, [u8;4], ArpEntry>>>,
         network_state_client: NetworkStateClient,
         flow_manager_client: FlowManagerClient,
     ) -> Handler {
@@ -133,7 +133,6 @@ impl Handler {
         let dst_ip = ip_packet.get_destination();
         let src_ip = ip_packet.get_source();
         info!("src_ip: {:?}, dst_ip: {:?}", src_ip, dst_ip);
-
         let src_dst_port = match ip_packet.get_next_level_protocol(){
             IpNextHeaderProtocols::Tcp => {
                 let tcp_packet = pnet::packet::tcp::TcpPacket::new(ip_packet.payload()).unwrap();
@@ -172,6 +171,7 @@ impl Handler {
             if let Ok(ifidx_queue_id) = self.flow_manager_client.get_ifidx_queue(flow_key).await{
                 if let Some((ifidx, queue_id)) = ifidx_queue_id{
                     info!("found flow_next_hop: {:?}", ifidx_queue_id);
+                    self.flow_manager_client.incr_stats_packet_count(ifidx).await.unwrap();
                     return Some(vec![(ifidx, queue_id)]);
                 }
             } else {
@@ -249,17 +249,22 @@ impl Handler {
                     fwd: fwd_flow,
                     rev: rev_flow,
                 };
-                self.flow_manager_client.add_flow(fwd_rev_flow).await.
+                self.flow_manager_client.add_flow(fwd_rev_flow, ifidx).await.
                     unwrap_or_else(|e| error!("Failed to add flow: {}", e));
             }
+            self.flow_manager_client.incr_stats_packet_count(ret.as_ref().unwrap()[0].0).await.unwrap();
             return ret
         }
-
-        info!("checking arp_table");
-        
-        let arp_entry = self.global_arp_table.lock().unwrap().get(&u32::from_be_bytes(dst_ip.octets()), 0).ok();
+        self.global_arp_table.lock().unwrap().iter().for_each(|val|{
+            if let Ok((k, v)) = val{
+                info!("arp_table: {:?} {:?}", Ipv4Addr::from(u32::from_be_bytes(k)), v);
+            } else {
+                error!("failed to get arp_table entry");
+            }
+        });
+        let arp_entry = self.global_arp_table.lock().unwrap().get(&dst_ip.octets(), 0).ok();
         if let Some(arp_entry) = arp_entry{
-            if let Some(intf) = self.network_state_client.get_interface(ifidx).await{
+            if let Some(intf) = self.network_state_client.get_interface(arp_entry.ifidx).await{
                 if let Some(bridge_id) = intf.bridge_id{   
                     info!("found arp_entry: {:?}", arp_entry);
                     eth_packet.set_destination(arp_entry.smac.into());
@@ -317,15 +322,20 @@ impl Handler {
                             rev: rev_flow,
                         };
                     
-                        self.flow_manager_client.add_flow(fwd_rev_flow).await.
+                        self.flow_manager_client.add_flow(fwd_rev_flow, ifidx).await.
                             unwrap_or_else(|e| error!("Failed to add flow: {}", e));
                     }
+                    self.flow_manager_client.incr_stats_packet_count(arp_entry.ifidx).await.unwrap();
                     return Some(vec![(arp_entry.ifidx, queue_id)]);
+                } else {
+                    info!("no bridge found for ifidx: {}", ifidx);
                 }
+            } else {
+                info!("no interface found for ifidx: {}", ifidx);
             }
+        } else {
+            info!("no arp entry found for dst_ip {:?}", dst_ip);
         }
-        
-        info!("no arp entry found for src_ip {:?} dst_ip {:?}", src_ip, dst_ip);
         
 
         info!("checking routes");
@@ -409,19 +419,25 @@ impl Handler {
 
             if let Some(fwd_rev_flow) = fwd_rev_flow{
                 let fwd_flow_key = fwd_rev_flow.fwd.key;
-                self.flow_manager_client.add_flow(fwd_rev_flow).await.
+                self.flow_manager_client.add_flow(fwd_rev_flow, ifidx).await.
                     unwrap_or_else(|e| error!("Failed to add flow: {}", e));
                 if let Ok(res) = self.flow_manager_client.get_ifidx_queue(fwd_flow_key).await{
                     if let Some((ifidx, queue_id)) = res{
+                        self.flow_manager_client.incr_stats_packet_count(ifidx).await.unwrap();
                         return Some(vec![(ifidx, queue_id)]);
                     }
                 } else if ret.is_some(){
+                    self.flow_manager_client.incr_stats_packet_count(ret.as_ref().unwrap()[0].0).await.unwrap();
                     return ret
                 }
             } else if ret.is_some(){
+                self.flow_manager_client.incr_stats_packet_count(ret.as_ref().unwrap()[0].0).await.unwrap();
                 return ret
+            } else {
+                info!("no next hop found for src_ip {:?}, dst_ip: {:?}", src_ip, dst_ip);
             }
 
+            info!("ret {:?}", ret);
             let bridges = self.network_state_client.get_bridges_from_vrf(vrf).await;
             for bridge in &bridges{
                 for (prefix, prefix_len) in &bridge.ips{
@@ -432,11 +448,6 @@ impl Handler {
                             info!("intf: {:?}", interface);
                             if let Some(dst_mac) = self.network_state_client.send_arp_request(u32::from_be_bytes(dst_ip.octets()), bridge.mac, *prefix, *interface).await{
                                 info!("dst_mac: {:?}", MacAddr::from(dst_mac));
-                                self.global_arp_table.lock().unwrap().insert(&u32::from_be_bytes(dst_ip.octets()), &ArpEntry{
-                                    ifidx: *interface,
-                                    smac: dst_mac,
-                                    pad: 0,
-                                }, 0).unwrap();
                                 eth_packet.set_destination(dst_mac.into());
                                 eth_packet.set_source(bridge.mac.into());
                                 if let Some((src_port, dst_port)) = src_dst_port{
@@ -494,12 +505,20 @@ impl Handler {
                                         rev: rev_flow,
                                     };
 
-                                    self.flow_manager_client.add_flow(fwd_rev_flow).await.
+                                    self.flow_manager_client.add_flow(fwd_rev_flow, ifidx).await.
                                         unwrap_or_else(|e| error!("Failed to add flow: {}", e));
+                                    if let Some(res) = self.flow_manager_client.get_ifidx_queue(fwd_flow_key).await.
+                                        unwrap_or_else(|e| { 
+                                            error!("Failed to get ifidx_queue: {}", e);
+                                            None
+                                        }){
+                                            self.flow_manager_client.incr_stats_packet_count(res.0).await.unwrap();
+                                            return Some(vec![(res.0, res.1)]);
+                                        }
+                                } else {
+                                    self.flow_manager_client.incr_stats_packet_count(*interface).await.unwrap();
+                                    return Some(vec![(*interface, queue_id)]);
                                 }
-                                return Some(vec![(*interface, queue_id)]);
-                            } else {
-                                error!("dst_mac not found from arp request");
                             }
                         }
                     }

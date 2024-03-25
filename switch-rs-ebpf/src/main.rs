@@ -18,12 +18,15 @@ use network_types::{
     udp::UdpHdr,
 };
 use switch_rs_common::{
+    ArpHdr,
     InterfaceConfig,
     InterfaceQueue,
     FlowKey,
     FlowNextHop,
     ArpEntry,
-    InterfaceConfiguration
+    InterfaceConfiguration,
+    InterfaceStats,
+    MetaData
 };
 
 #[map(name = "INTERFACEMAP")]
@@ -39,8 +42,8 @@ static mut MACTABLE: HashMap<[u8;6], u32> =
     HashMap::<[u8;6], u32>::with_max_entries(1000, 0);
 
 #[map(name = "ARPTABLE")]
-static mut ARPTABLE: HashMap<u32, ArpEntry> =
-    HashMap::<u32, ArpEntry>::with_max_entries(1000, 0);
+static mut ARPTABLE: HashMap<[u8;4], ArpEntry> =
+    HashMap::<[u8;4], ArpEntry>::with_max_entries(1000, 0);
 
 #[map(name = "XSKMAP")]
 static mut XSKMAP: XskMap = XskMap::with_max_entries(256, 0);
@@ -52,6 +55,10 @@ static mut INTERFACEQUEUETABLE: HashMap<InterfaceQueue, u32> =
 #[map(name = "INTERFACECONFIGURATION")]
 static mut INTERFACECONFIGURATION: HashMap<u32, InterfaceConfiguration> =
     HashMap::<u32, InterfaceConfiguration>::with_max_entries(256, 0);
+
+#[map(name = "INTERFACESTATS")]
+static mut INTERFACESTATS: HashMap<u32, InterfaceStats> =
+    HashMap::<u32, InterfaceStats>::with_max_entries(256, 0);
 
 #[map(name = "FLOWTABLE")]
 static mut FLOWTABLE: HashMap<FlowKey, FlowNextHop> =
@@ -79,9 +86,25 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
             }
         };
 
+        let arp_hdr = match ptr_at::<ArpHdr>(&ctx, EthHdr::LEN){
+            Some(arp_hdr) => arp_hdr,
+            None => {
+                info!(&ctx,"failed to get ARP header from packet at offset {}", EthHdr::LEN);
+                return Ok(xdp_action::XDP_ABORTED);
+            }
+        };
+
         if interface_configuration.l2 == 1 {
             unsafe { MACTABLE.insert(&smac, &ingress_if_idx, 0).map_err(|_| {
                 info!(&ctx,"failed to insert MAC address into MACTABLE");
+                xdp_action::XDP_ABORTED
+            })? };
+            unsafe { ARPTABLE.insert(&(*arp_hdr).spa, &ArpEntry{
+                ifidx: ingress_if_idx,
+                smac,
+                pad: 0,
+            }, 0).map_err(|_| {
+                info!(&ctx,"failed to insert ARP entry into ARPTABLE");
                 xdp_action::XDP_ABORTED
             })? };
         } else {
@@ -91,26 +114,25 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                 ingress_if_idx,
                 queue
             );
-            unsafe { ARPTABLE.insert(&u32::from_be(0), &ArpEntry{
-                ifidx: ingress_if_idx,
-                smac,
-                pad: 0,
-            }, 0).map_err(|_| {
-                info!(&ctx,"failed to insert ARP entry into ARPTABLE");
-                xdp_action::XDP_ABORTED
-            })? };
+
         }
         return Ok(xdp_action::XDP_PASS);
     }
 
     if unsafe { (*eth_hdr).ether_type } == EtherType::Ipv4 {
-        let ipv4_hdr = match ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN){
+        info!(&ctx, "interface {} received IPv4 packet", ingress_if_idx);
+        unsafe { INTERFACESTATS.get_ptr_mut(&ingress_if_idx) }.map(|interface_stats|{
+            unsafe { (*interface_stats).rx_packets += 1 };
+        });
+
+        let ipv4_hdr = match ptr_at_mut::<Ipv4Hdr>(&ctx, EthHdr::LEN){
             Some(ipv4_hdr) => ipv4_hdr,
             None => {
                 info!(&ctx,"failed to get IPv4 header from packet at offset {}", EthHdr::LEN);
                 return Ok(xdp_action::XDP_ABORTED);
             }
         };
+        //unsafe { (*ipv4_hdr).tos = u8::to_be(1) };
         let ip_proto = unsafe { (*ipv4_hdr).proto };
         let source_dest_port = match ip_proto{
             IpProto::Tcp => {
@@ -150,13 +172,16 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                 dst_port: u16::from_be(dest),
             };
 
-            if let Some(flow_next_hop) = unsafe { FLOWTABLE.get_ptr_mut(&flow_key) }{         
+            if let Some(flow_next_hop) = unsafe { FLOWTABLE.get_ptr_mut(&flow_key) }{  
                 for i in 0..6{
                     unsafe { (*eth_hdr).src_addr[i] = (*flow_next_hop).src_mac[i] };
                     unsafe { (*eth_hdr).dst_addr[i] = (*flow_next_hop).dst_mac[i] };
                 }
                 unsafe { (*flow_next_hop).packet_count += 1 };
                 let ifidx = unsafe { (*flow_next_hop).ifidx };
+                unsafe { INTERFACESTATS.get_ptr_mut(&ifidx) }.map(|interface_stats|{
+                    unsafe { (*interface_stats).tx_packets += 1 };
+                });
                 let res = unsafe { bpf_redirect(ifidx, 0)};
                 return Ok(res as u32)
                 
@@ -227,13 +252,17 @@ pub fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Option<*const T> {
 
 #[inline(always)]
 pub fn ptr_at_md<T>(ctx: &XdpContext, offset: usize) -> Option<*const T> {
-    let start = ctx.metadata();
-    let end = ctx.metadata_end();
+    info!(ctx, "trying to get metadata");
+    let start = unsafe { (*ctx.ctx).data } as usize;
+    let end = unsafe { (*ctx.ctx).data_meta } as usize;
     let len = mem::size_of::<T>();
-    
+    info!(ctx, "got metadata");
+
 
     if start + offset + len > end {
+        info!(ctx, "returning None");
         return None;
     }
+    info!(ctx, "returning metadata");
     Some((start + offset) as *const T)
 }
