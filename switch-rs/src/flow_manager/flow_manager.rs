@@ -1,6 +1,5 @@
-use std::{collections::{BTreeMap, HashMap}, sync::{Arc, Mutex}};
+use std::{collections::HashMap, sync::{atomic::AtomicU64, Arc, Mutex}};
 use aya::maps::{HashMap as BpfHashMap, MapData};
-use log::info;
 use switch_rs_common::{FlowKey, FlowNextHop, InterfaceConfiguration, InterfaceStats};
 use tokio::{sync::{mpsc::Receiver, RwLock}, time::Instant};
 
@@ -18,11 +17,12 @@ impl FlowManager{
             client,
         }
     }
-    pub async fn run(&mut self, mut global_flow_table: BpfHashMap<MapData, FlowKey, FlowNextHop>, mut interface_stats: BpfHashMap<MapData, u32, InterfaceStats>, mut interface_config: Arc<Mutex<BpfHashMap<MapData, u32, InterfaceConfiguration>>>){
+    pub async fn run(&mut self, mut global_flow_table: BpfHashMap<MapData, FlowKey, FlowNextHop>, mut interface_stats: BpfHashMap<MapData, u32, InterfaceStats>, interface_config: Arc<Mutex<BpfHashMap<MapData, u32, InterfaceConfiguration>>>){
         let mut jh_list = Vec::new();
         let mut monitor_interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
-        let mut stats_interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
         let mut local_flow_table: HashMap<FlowKey, LocalNextHop> = HashMap::new();
+        let mut flow_timeout = 10;
+        let mut max_packets = 1000;
         let rx = self.rx.clone();
         let jh = tokio::spawn(async move {
             let mut rx = rx.write().await;
@@ -31,14 +31,12 @@ impl FlowManager{
                     cmd = rx.recv() => {
                         if let Some(cmd) = cmd{
                             match cmd{
-                                FlowCommand::AddFlow { flow, ifidx } => {
-
+                                FlowCommand::AddFlow { flow } => {
                                     let flow_key = flow.key;
                                     let mut flow_next_hops = flow.next_hops;
                                     if flow_next_hops.is_empty(){
                                         continue;
                                     }
-
                                     let mut nh_ranked_list = Vec::new();
                                     for next_hop in &flow_next_hops{
                                         let iface_stats = interface_stats.get(&next_hop.oif_idx, 0).unwrap();
@@ -47,8 +45,6 @@ impl FlowManager{
                                     nh_ranked_list.sort_by(|a,b|a.0.cmp(&b.0));
 
                                     flow_next_hops = nh_ranked_list.into_iter().map(|(_, v)| v).collect();
-
-
 
                                     for nh in &mut flow_next_hops{
                                         nh.active_next_hop = 0;
@@ -97,7 +93,6 @@ impl FlowManager{
                                             if let Some(local_next_hop) = local_flow_table.get(&flow_key){
                                                 flow_map.insert(flow_key.clone(), (flow_next_hop.clone(), local_next_hop.last_updated));
                                             }
-                                            
                                         }
                                     }
                                     let _ = tx.send(flow_map);
@@ -114,16 +109,29 @@ impl FlowManager{
                                         let _ = global_flow_table.insert(flow_key, flow, 0);
                                     }
                                 },
+                                FlowCommand::SetMaxPackets { max_packets: mp } => {
+                                    max_packets = mp;
+                                },
+                                FlowCommand::SetFlowTimeout { flow_timeout: ft } => {
+                                    flow_timeout = ft;
+                                },
+                                FlowCommand::ShowFlowTimeout { tx } => {
+                                    tx.send(flow_timeout).map_err(|e| log::error!("Failed to show flow timeout: {}", e)).unwrap();
+                                },
+                                FlowCommand::ShowMaxPackets { tx } => {
+                                    tx.send(max_packets).map_err(|e| log::error!("Failed to show max packets: {}", e)).unwrap();
+                                },
                             }
                         }
                     },
                     _ = monitor_interval.tick() => {
                         let mut inactive_flows = Vec::new();
+                        //let flow_timeout = flow_timeout.clone();
                         for (flow_key, local_next_hop) in &mut local_flow_table{
                             let flow_list = &local_next_hop.next_hop_list;
                             if let Ok(active_flow) = global_flow_table.get(flow_key, 0){
                                 let now = tokio::time::Instant::now();
-                                if now.duration_since(local_next_hop.last_updated).as_secs() > 30 && active_flow.packet_count == local_next_hop.packet_count{
+                                if now.duration_since(local_next_hop.last_updated).as_secs() >= flow_timeout && active_flow.packet_count == local_next_hop.packet_count{
                                     inactive_flows.push((flow_key.clone(), active_flow.oif_idx));
                                     continue;
                                 }
@@ -141,7 +149,7 @@ impl FlowManager{
                                 }
                                 local_next_hop.packet_count = active_flow.packet_count;
                                 if flow_list.len() > 1{
-                                    if active_flow.packet_count > active_flow.max_packets{
+                                    if active_flow.packet_count > max_packets && max_packets > 0{
                                         let active_next_hop = active_flow.active_next_hop;
                                         let next_active_next_hop_index = (active_next_hop + 1) % flow_list.len() as u32;
                                         let mut next_active_next_hop = flow_list[next_active_next_hop_index as usize];
@@ -150,13 +158,11 @@ impl FlowManager{
                                         let _ = global_flow_table.insert(flow_key, next_active_next_hop, 0);
                                         if let Ok(mut stats) = interface_stats.get(&active_flow.oif_idx, 0){
                                             if stats.flows > 0{
-                                                info!("decrementing flows for interface {}", active_flow.oif_idx);
                                                 stats.flows -= 1;
                                                 interface_stats.insert(&active_flow.oif_idx, stats, 0).unwrap();
                                             }
                                         }
                                         if let Ok(mut stats) = interface_stats.get(&next_active_next_hop.oif_idx, 0){
-                                            info!("incrementing 2 flows for interface {}", next_active_next_hop.oif_idx);
                                             stats.flows += 1;
                                             interface_stats.insert(&next_active_next_hop.oif_idx, stats, 0).unwrap();
                                         }
@@ -176,14 +182,6 @@ impl FlowManager{
 
                         }
                     },
-                    _ = stats_interval.tick() => {
-                        for res in interface_stats.iter(){
-                            if let Ok((ifidx, stats)) = res{
-                                //log::info!("Interface {}: {:?}", ifidx, stats);
-                            }
-                        }
-                    },
-                
                 }
             }
         });
@@ -214,8 +212,8 @@ impl FlowManagerClient{
     pub fn new(tx: tokio::sync::mpsc::Sender<FlowCommand>) -> Self{
         FlowManagerClient{tx}
     }
-    pub async fn add_flow(&self, flow: Flow, ifidx: u32) -> anyhow::Result<()>{
-        self.tx.send(FlowCommand::AddFlow{flow, ifidx}).await.
+    pub async fn add_flow(&self, flow: Flow) -> anyhow::Result<()>{
+        self.tx.send(FlowCommand::AddFlow{flow}).await.
             map_err(|e| anyhow::anyhow!("Failed to send add flow command: {}", e))
     }
     pub async fn get_ifidx_queue(&self, flow_key: FlowKey) -> anyhow::Result<Option<(u32, u32)>>{
@@ -250,11 +248,30 @@ impl FlowManagerClient{
         self.tx.send(FlowCommand::IncrFlowPacketCount{flow_key}).await.
             map_err(|e| anyhow::anyhow!("Failed to send increment flow packet count command: {}", e))
     }
+    pub async fn set_max_packets(&self, max_packets: u64) -> anyhow::Result<()>{
+        self.tx.send(FlowCommand::SetMaxPackets{max_packets}).await.
+            map_err(|e| anyhow::anyhow!("Failed to send set max packets command: {}", e))
+    }
+    pub async fn set_flow_timeout(&self, flow_timeout: u64) -> anyhow::Result<()>{
+        self.tx.send(FlowCommand::SetFlowTimeout{flow_timeout}).await.
+            map_err(|e| anyhow::anyhow!("Failed to send set flow timeout command: {}", e))
+    }
+    pub async fn show_flow_timeout(&self) -> anyhow::Result<u64>{
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(FlowCommand::ShowFlowTimeout{tx}).await.
+            map_err(|e| anyhow::anyhow!("Failed to send show flow timeout command: {}", e))?;
+        rx.await.map_err(|e| anyhow::anyhow!("Failed to show flow timeout: {}", e))
+    }
+    pub async fn show_max_packets(&self) -> anyhow::Result<u64>{
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(FlowCommand::ShowMaxPackets{tx}).await.
+            map_err(|e| anyhow::anyhow!("Failed to send show max packets command: {}", e))?;
+        rx.await.map_err(|e| anyhow::anyhow!("Failed to show max packets: {}", e))
+    }
 }
 
 pub enum FlowCommand{
     AddFlow{
-        ifidx: u32,
         flow: Flow,
     },
     GetIfidxQueue{
@@ -280,6 +297,18 @@ pub enum FlowCommand{
     },
     IncrFlowPacketCount{
         flow_key: FlowKey,
+    },
+    SetMaxPackets{
+        max_packets: u64,
+    },
+    SetFlowTimeout{
+        flow_timeout: u64,
+    },
+    ShowFlowTimeout{
+        tx: tokio::sync::oneshot::Sender<u64>,
+    },
+    ShowMaxPackets{
+        tx: tokio::sync::oneshot::Sender<u64>,
     },
 }
 

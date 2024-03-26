@@ -1,8 +1,9 @@
-use std::{net::Ipv4Addr, process::exit};
+use std::{fmt::Display, net::Ipv4Addr, process::exit, str::FromStr};
 
-use inquire::{error::CustomUserError, length, required, ui::RenderConfig, Text};
+use inquire::{error::CustomUserError, length, parser::CustomTypeParser, required, ui::RenderConfig, CustomType, Text};
+use log::info;
 use switch_rs_common::{FlowKey, FlowNextHop};
-
+use clap::{ArgMatches, FromArgMatches, Parser, Subcommand};
 use crate::flow_manager::flow_manager::FlowManagerClient;
 
 pub struct Cli{
@@ -20,40 +21,68 @@ impl Cli {
     }
 }
 
+/*
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+#[command(propagate_version = true)]
+struct Commander {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+*/
 
-enum CliCommands{
-    Get{
-        ifidx: u32,
-    },
-    List(CliItem),
-    Exit(),
+#[derive(Clone, Parser, Debug)]
+enum Commands {
+    #[command(subcommand)]
+    Show(ShowCommands),
+    #[command(subcommand)]
+    Set(SetCommands),
+    Exit,
 }
 
-enum CliItem{
+#[derive(Clone, Parser, Debug)]
+enum ShowCommands {
     Stats,
-    Flows
+    Flows,
+    MaxPackets,
+    FlowTimeout,
 }
+
+#[derive(Clone, Parser, Debug)]
+enum SetCommands {
+    MaxPackets{max_packets: u64},
+    FlowTimeout{flow_timeout: u64},
+}
+
 
 async fn cli(client: FlowManagerClient) -> anyhow::Result<()> {
+
     let jh = tokio::spawn(async move {
         loop{
-            let command = Text::new("Cmd -> ")
-            .with_autocomplete(&suggester)
+            
+            let input = Text::new("Cmd -> ")
+            .with_autocomplete(&root_suggester)
             .with_validator(required!())
             //.with_validator(length!(10))
             .prompt()
             .unwrap();
 
-            let command = parse_command(command.as_str());
+            let mut input_string = input.split_whitespace().collect::<Vec<_>>();
+            input_string.insert(0, "");
 
-            match command {
-                CliCommands::Get{ifidx} => {
-                    let stats = client.get_stats(ifidx).await.unwrap();
-                    println!("Interface Stats: {:?}", stats);
-                },
-                CliCommands::List(cli_item) => {
-                    match cli_item{
-                        CliItem::Stats => {
+            let cmds = Commands::parse_from(input_string);
+            match cmds {
+                Commands::Show(show_command) => {
+                    match show_command{
+                        ShowCommands::Flows => {
+                            let flows = client.list_flows().await.unwrap();
+                            let mut flows_list = flows.iter().collect::<Vec<_>>();
+                            flows_list.sort_by_key(|(flow_key, _)| *flow_key);
+                            for (flow_key, (flow, last_updated)) in flows.iter(){
+                                println!("Flow {} {}", display_flow_key(flow_key), display_flow_next_hop(flow, last_updated));
+                            }
+                        },
+                        ShowCommands::Stats => {
                             let stats = client.list_stats().await.unwrap();
                             let mut stats_list = stats.iter().collect::<Vec<_>>();
                             stats_list.sort_by_key(|(ifidx, _)| *ifidx);
@@ -61,59 +90,49 @@ async fn cli(client: FlowManagerClient) -> anyhow::Result<()> {
                                 println!("Interface {} {}", ifidx, stats);
                             }
                         },
-                        CliItem::Flows => {
-                            let flows = client.list_flows().await.unwrap();
-                            let mut flows_list = flows.iter().collect::<Vec<_>>();
-                            flows_list.sort_by_key(|(flow_key, _)| *flow_key);
-                            for (flow_key, (flow, last_updated)) in flows.iter(){
-                                println!("Flow {} {}", display_flow_key(flow_key), display_flow_next_hop(flow, last_updated));
-                            }
+                        ShowCommands::MaxPackets => {
+                            let max_packets = client.show_max_packets().await.unwrap();
+                            println!("max_packets: {}", max_packets);
+                        },
+                        ShowCommands::FlowTimeout => {
+                            let flow_timeout = client.show_flow_timeout().await.unwrap();
+                            println!("flow_timeout: {}", flow_timeout);
                         }
                     }
-                }
-                CliCommands::Exit() => {
+                },
+                Commands::Set(set_command) => {
+                    match set_command{
+                        SetCommands::MaxPackets{max_packets} => {
+                            println!("Setting max_packets to {}", max_packets);
+                            client.set_max_packets(max_packets).await.unwrap();
+                            println!("max_packets set to {}", client.show_max_packets().await.unwrap());
+                        },
+                        SetCommands::FlowTimeout{flow_timeout} => {
+                            println!("Setting flow_timeout to {}", flow_timeout);
+                            client.set_flow_timeout(flow_timeout).await.unwrap();
+                            println!("flow_timeout set to {}", client.show_flow_timeout().await.unwrap());
+                        },
+                    }
+                },
+                Commands::Exit => {
                     exit(0);
                 }
             }
-            
         }
     });
     jh.await?;
     Ok(())
 }
 
-fn parse_command(command: &str) -> CliCommands {
-    let command = command.trim();
-    let mut parts = command.split_whitespace();
-    match parts.next() {
-        Some("get") => {
-            let ifidx = parts.next().unwrap().parse().unwrap();
-            CliCommands::Get{ifidx}
-        },
-        Some("list") => {
-            let item = parts.next().unwrap();
-            parse_list_command(item)
-        },
-        Some("exit") => CliCommands::Exit(),
-        _ => panic!("Invalid command"),
-    }
-}
-
-fn parse_list_command(item: &str) -> CliCommands {
-    match item {
-        "stats" => CliCommands::List(CliItem::Stats),
-        "flows" => CliCommands::List(CliItem::Flows),
-        _ => panic!("Invalid command"),
-    }
-}
-
-fn suggester(val: &str) -> Result<Vec<String>, CustomUserError> {
+fn root_suggester(val: &str) -> Result<Vec<String>, CustomUserError> {
     let suggestions = [
-        "get <ifidx>",
-        "list flows",
-        "list stats",
-        "update configuration",
-        "exit"
+        "set max-packets",
+        "set flow-timeout",
+        "show flows",
+        "show stats",
+        "show max-packets",
+        "show flow-timeout",
+        "exit",
     ];
 
     let val_lower = val.to_lowercase();
@@ -124,6 +143,7 @@ fn suggester(val: &str) -> Result<Vec<String>, CustomUserError> {
         .map(|s| String::from(*s))
         .collect())
 }
+
 
 fn display_flow_key(flow_key: &FlowKey) -> String {
     let src_ip = Ipv4Addr::from(flow_key.src_ip);
