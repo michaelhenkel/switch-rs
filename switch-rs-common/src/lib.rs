@@ -72,6 +72,7 @@ pub struct FlowNextHop{
     pub packet_count: u64,
     pub active_next_hop: u32,
     pub max_packets: u64,
+    pub ecn: u8,
 }
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FlowNextHop {}
@@ -93,7 +94,8 @@ pub struct InterfaceConfiguration{
     pub bridge_id: [u8;6],
     pub l2: u8,
     pub pad: u8,
-    pub max_packets: u32,
+    pub flowlet_size: u32,
+    pub mac: [u8;6],
 }
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for InterfaceConfiguration {}
@@ -105,6 +107,9 @@ pub struct InterfaceStats{
     pub tx_packets: u64,
     pub flows: u64,
     pub rate: u64,
+    pub ecn_marked: u64,
+    pub flowlet_packets: u32,
+    pub pause_sent: u64,
 }
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for InterfaceStats {}
@@ -112,7 +117,7 @@ unsafe impl aya::Pod for InterfaceStats {}
 #[cfg(feature = "user")]
 impl Display for InterfaceStats {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "rx_packets: {}, tx_packet: {}, flows: {}, rate: {}", self.rx_packets, self.tx_packets, self.flows, self.rate)
+        write!(f, "rx_packets: {}, tx_packet: {}, ecn_marked: {}, pause_sent {}, flows: {}, flowlet_packets: {}", self.rx_packets, self.tx_packets, self.ecn_marked, self.pause_sent, self.flows, self.flowlet_packets)
     }
 }
 

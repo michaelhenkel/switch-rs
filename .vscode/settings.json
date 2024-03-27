@@ -1,5 +1,10 @@
 {
-  "rust-analyzer.linkedProjects": ["Cargo.toml", "switch-rs-ebpf/Cargo.toml"],
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml",
+    "switch-rs-ebpf/Cargo.toml",
+    "./switch-rs/Cargo.toml",
+    "./switch-rs/Cargo.toml"
+  ],
   "rust-analyzer.cargo.target": "x86_64-unknown-linux-gnu",
   "rust.all_targets": false,
   "rust-analyzer.checkOnSave.allTargets": false,

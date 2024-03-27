@@ -2,27 +2,41 @@ use std::{collections::HashMap, sync::{atomic::AtomicU64, Arc, Mutex}};
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use switch_rs_common::{FlowKey, FlowNextHop, InterfaceConfiguration, InterfaceStats};
 use tokio::{sync::{mpsc::Receiver, RwLock}, time::Instant};
+use crate::network_state::network_state::NetworkStateClient;
+
+const FLOWLET_SIZE: u32 = 10;
 
 pub struct FlowManager{
     rx: Arc<RwLock<Receiver<FlowCommand>>>,
     client: FlowManagerClient,
+    network_state_client: NetworkStateClient,
 }
 
 impl FlowManager{
-    pub fn new() -> Self{
+    pub fn new(network_state_client: NetworkStateClient) -> Self{
         let (tx, rx) = tokio::sync::mpsc::channel(100);
         let client = FlowManagerClient::new(tx.clone());
         FlowManager{
             rx: Arc::new(RwLock::new(rx)),
             client,
+            network_state_client,
         }
     }
-    pub async fn run(&mut self, mut global_flow_table: BpfHashMap<MapData, FlowKey, FlowNextHop>, mut interface_stats: BpfHashMap<MapData, u32, InterfaceStats>, interface_config: Arc<Mutex<BpfHashMap<MapData, u32, InterfaceConfiguration>>>){
+    pub async fn run(
+        &mut self,
+        mut global_flow_table: BpfHashMap<MapData, FlowKey, FlowNextHop>,
+        mut interface_stats: BpfHashMap<MapData, u32, InterfaceStats>,
+        interface_config: Arc<RwLock<BpfHashMap<MapData, u32, InterfaceConfiguration>>>,
+        mut ecn_marker_table: BpfHashMap<MapData, FlowKey, u8>,
+    ){
         let mut jh_list = Vec::new();
+        let mut pause_on = false;
         let mut monitor_interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
         let mut local_flow_table: HashMap<FlowKey, LocalNextHop> = HashMap::new();
         let mut flow_timeout = 10;
         let mut max_packets = 1000;
+        let mut flowlet_size = FLOWLET_SIZE;
+        let network_state_client = self.network_state_client.clone();
         let rx = self.rx.clone();
         let jh = tokio::spawn(async move {
             let mut rx = rx.write().await;
@@ -84,7 +98,7 @@ impl FlowManager{
                                     let _ = tx.send(stats_map);
                                 },
                                 FlowCommand::UpdateInterfaceConfiguration { ifidx, interface_configuration } => {
-                                    let _ = interface_config.lock().unwrap().insert(&ifidx, interface_configuration, 0);
+                                    //let _ = interface_config.lock().unwrap().insert(&ifidx, interface_configuration, 0);
                                 },
                                 FlowCommand::ListFlows { tx } => {
                                     let mut flow_map = HashMap::new();
@@ -121,12 +135,33 @@ impl FlowManager{
                                 FlowCommand::ShowMaxPackets { tx } => {
                                     tx.send(max_packets).map_err(|e| log::error!("Failed to show max packets: {}", e)).unwrap();
                                 },
+                                FlowCommand::TogglePause { on_off } => {
+                                    pause_on = on_off;
+                                },
+                                FlowCommand::ShowPause { tx } => {
+                                    tx.send(pause_on).map_err(|e| log::error!("Failed to show pause: {}", e)).unwrap();
+                                },
+                                FlowCommand::SetFlowletSize { flowlet_size: fs } => {
+                                    flowlet_size = fs;
+                                    let mut res_map = HashMap::new();
+                                    for res in interface_config.write().await.iter(){
+                                        if let Ok((ifidx, mut interface_configuration)) = res {
+                                            interface_configuration.flowlet_size = fs;
+                                            res_map.insert(ifidx.clone(), interface_configuration.clone());
+                                        }
+                                    }
+                                    for (ifidx, interface_configuration) in res_map{
+                                        interface_config.write().await.insert(&ifidx, interface_configuration, 0).unwrap();
+                                    }
+                                },
+                                FlowCommand::ShowFlowletSize { tx } => {
+                                    tx.send(flowlet_size).map_err(|e| log::error!("Failed to show flowlet size: {}", e)).unwrap();
+                                },
                             }
                         }
                     },
                     _ = monitor_interval.tick() => {
                         let mut inactive_flows = Vec::new();
-                        //let flow_timeout = flow_timeout.clone();
                         for (flow_key, local_next_hop) in &mut local_flow_table{
                             let flow_list = &local_next_hop.next_hop_list;
                             if let Ok(active_flow) = global_flow_table.get(flow_key, 0){
@@ -149,7 +184,9 @@ impl FlowManager{
                                 }
                                 local_next_hop.packet_count = active_flow.packet_count;
                                 if flow_list.len() > 1{
-                                    if active_flow.packet_count > max_packets && max_packets > 0{
+
+
+                                    if active_flow.packet_count > flowlet_size as u64 && flowlet_size > 0{
                                         let active_next_hop = active_flow.active_next_hop;
                                         let next_active_next_hop_index = (active_next_hop + 1) % flow_list.len() as u32;
                                         let mut next_active_next_hop = flow_list[next_active_next_hop_index as usize];
@@ -179,8 +216,29 @@ impl FlowManager{
                                     interface_stats.insert(&ifidx, stats, 0).unwrap();
                                 }
                             }
-
                         }
+                        if pause_on{
+                            let mut reset_stats = HashMap::new();
+                            for res in interface_stats.iter(){
+                                if let Ok((interface, mut stats)) = res{
+                                    if let Ok(interface_configuration) = interface_config.read().await.get(&interface, 0){
+                                        if interface_configuration.l2 == 1{
+                                            if stats.flowlet_packets > 0 && stats.flowlet_packets >= max_packets as u32{
+                                                network_state_client.send_pause_frame(interface_configuration.mac, interface).await;
+                                                stats.flowlet_packets = 0;
+                                                stats.pause_sent += 1;
+                                                reset_stats.insert(interface, stats);
+                                                
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            for (intf, stats) in reset_stats{
+                                interface_stats.insert(&intf, stats, 0).unwrap();
+                            }
+                        }
+
                     },
                 }
             }
@@ -268,6 +326,26 @@ impl FlowManagerClient{
             map_err(|e| anyhow::anyhow!("Failed to send show max packets command: {}", e))?;
         rx.await.map_err(|e| anyhow::anyhow!("Failed to show max packets: {}", e))
     }
+    pub async fn toggle_pause(&self, on_off: bool) -> anyhow::Result<()>{
+        self.tx.send(FlowCommand::TogglePause{on_off}).await.
+            map_err(|e| anyhow::anyhow!("Failed to send toggle pause command: {}", e))
+    }
+    pub async fn show_pause(&self) -> anyhow::Result<bool>{
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(FlowCommand::ShowPause{tx}).await.
+            map_err(|e| anyhow::anyhow!("Failed to send show pause command: {}", e))?;
+        rx.await.map_err(|e| anyhow::anyhow!("Failed to show pause: {}", e))
+    }
+    pub async fn set_flowlet_size(&self, flowlet_size: u32) -> anyhow::Result<()>{
+        self.tx.send(FlowCommand::SetFlowletSize{flowlet_size}).await.
+            map_err(|e| anyhow::anyhow!("Failed to send set flowlet size command: {}", e))
+    }
+    pub async fn show_flowlet_size(&self) -> anyhow::Result<u32>{
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(FlowCommand::ShowFlowletSize{tx}).await.
+            map_err(|e| anyhow::anyhow!("Failed to send show flowlet size command: {}", e))?;
+        rx.await.map_err(|e| anyhow::anyhow!("Failed to show flowlet size: {}", e))
+    }
 }
 
 pub enum FlowCommand{
@@ -304,12 +382,24 @@ pub enum FlowCommand{
     SetFlowTimeout{
         flow_timeout: u64,
     },
+    SetFlowletSize{
+        flowlet_size: u32,
+    },
+    ShowFlowletSize{
+        tx: tokio::sync::oneshot::Sender<u32>,
+    },
     ShowFlowTimeout{
         tx: tokio::sync::oneshot::Sender<u64>,
     },
     ShowMaxPackets{
         tx: tokio::sync::oneshot::Sender<u64>,
     },
+    TogglePause{
+        on_off: bool,
+    },
+    ShowPause{
+        tx: tokio::sync::oneshot::Sender<bool>,
+    }
 }
 
 #[derive(Default)]

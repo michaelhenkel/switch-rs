@@ -4,7 +4,7 @@
 use core::mem;
 use aya_bpf::{
     bindings::xdp_action,
-    helpers::bpf_redirect,
+    helpers::{bpf_redirect, bpf_csum_diff},
     macros::{map, xdp},
     maps::{HashMap, XskMap},
     programs::XdpContext,
@@ -25,8 +25,7 @@ use switch_rs_common::{
     FlowNextHop,
     ArpEntry,
     InterfaceConfiguration,
-    InterfaceStats,
-    MetaData
+    InterfaceStats
 };
 
 #[map(name = "INTERFACEMAP")]
@@ -63,6 +62,10 @@ static mut INTERFACESTATS: HashMap<u32, InterfaceStats> =
 #[map(name = "FLOWTABLE")]
 static mut FLOWTABLE: HashMap<FlowKey, FlowNextHop> =
     HashMap::<FlowKey, FlowNextHop>::with_max_entries(65535, 0);
+
+#[map(name = "ECNMARKERTABLE")]
+static mut ECNMARKERTABLE: HashMap<FlowKey, u8> =
+    HashMap::<FlowKey, u8>::with_max_entries(65535, 0);
 
 #[xdp]
 pub fn switch_rs(ctx: XdpContext) -> u32 {
@@ -107,22 +110,17 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                 info!(&ctx,"failed to insert ARP entry into ARPTABLE");
                 xdp_action::XDP_ABORTED
             })? };
-        } else {
-            info!(
-                &ctx,
-                "interface {}/{} is a L3 interface",
-                ingress_if_idx,
-                queue
-            );
-
         }
         return Ok(xdp_action::XDP_PASS);
     }
 
     if unsafe { (*eth_hdr).ether_type } == EtherType::Ipv4 {
-        info!(&ctx, "interface {} received IPv4 packet", ingress_if_idx);
-        unsafe { INTERFACESTATS.get_ptr_mut(&ingress_if_idx) }.map(|interface_stats|{
-            unsafe { (*interface_stats).rx_packets += 1 };
+        let flowlet_packets = unsafe { INTERFACESTATS.get_ptr_mut(&ingress_if_idx) }.map(|interface_stats|{
+            unsafe { 
+                (*interface_stats).rx_packets += 1;
+                (*interface_stats).flowlet_packets += 1;
+                (*interface_stats).flowlet_packets
+            }
         });
 
         let ipv4_hdr = match ptr_at_mut::<Ipv4Hdr>(&ctx, EthHdr::LEN){
@@ -171,7 +169,6 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                 src_port: u16::from_be(source),
                 dst_port: u16::from_be(dest),
             };
-
             if let Some(flow_next_hop) = unsafe { FLOWTABLE.get_ptr_mut(&flow_key) }{  
                 for i in 0..6{
                     unsafe { (*eth_hdr).src_addr[i] = (*flow_next_hop).src_mac[i] };
@@ -182,15 +179,60 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                 unsafe { INTERFACESTATS.get_ptr_mut(&ifidx) }.map(|interface_stats|{
                     unsafe { (*interface_stats).tx_packets += 1 };
                 });
+                
+                let send_ecn = if unsafe{ (*flow_next_hop).ecn == 1}{
+                    unsafe{ (*flow_next_hop).ecn = 0 };
+                    true
+                } else {
+                    false
+                };
+            
+                let interface_configuration = match unsafe { INTERFACECONFIGURATION.get(&ingress_if_idx) }{
+                    Some(interface_configuration) => interface_configuration,
+                    None => {
+                        info!(&ctx,"failed to get interface configuration from INTERFACECONFIGURATION");
+                        return Ok(xdp_action::XDP_ABORTED);
+                    }
+                };
+
+                if interface_configuration.l2 == 1 {
+                    if let Some(flowlet_packets) = flowlet_packets{
+                        let flowlet_size = interface_configuration.flowlet_size;
+                        if flowlet_packets > 0 && flowlet_packets >= flowlet_size{
+                            let rev_flow_key = FlowKey{
+                                src_ip: flow_key.dst_ip,
+                                dst_ip: flow_key.src_ip,
+                                src_port: flow_key.dst_port,
+                                dst_port: flow_key.src_port,
+                            };
+                            let rev_flow_next_hop = match unsafe { FLOWTABLE.get_ptr_mut(&rev_flow_key) }{
+                                Some(rev_flow_next_hop) => rev_flow_next_hop,
+                                None => {
+                                    info!(&ctx,"failed to get reverse flow from FLOWTABLE");
+                                    return Ok(xdp_action::XDP_ABORTED);
+                                }
+                            };
+                            unsafe { (*rev_flow_next_hop).ecn = 1 };
+                            unsafe { INTERFACESTATS.get_ptr_mut(&ingress_if_idx) }.map(|interface_stats|{
+                                unsafe { (*interface_stats).flowlet_packets = 0; };
+                            });
+                        }
+                    }
+                }
+                if send_ecn{
+                    unsafe { (*ipv4_hdr).check = 0};
+                    unsafe { (*ipv4_hdr).tos = 0x03 };
+                    let csum = _csum(ipv4_hdr as *mut u32, Ipv4Hdr::LEN as u32, 0);
+                    unsafe { (*ipv4_hdr).check = csum };
+                    unsafe { INTERFACESTATS.get_ptr_mut(&ingress_if_idx) }.map(|interface_stats|{
+                        unsafe { (*interface_stats).ecn_marked += 1 };
+                    });
+                }
                 let res = unsafe { bpf_redirect(ifidx, 0)};
                 return Ok(res as u32)
-                
             }
         }
     }
-
-    
-    
     let queue = unsafe { (*ctx.ctx).rx_queue_index };
     let queue_idx = match unsafe { INTERFACEQUEUETABLE.get(&InterfaceQueue::new(ingress_if_idx, queue))}{
         Some(queue_idx) => queue_idx,
@@ -208,22 +250,12 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
             Ok(xdp_action::XDP_ABORTED)
         }
     }
-    
-    
-    
-    
     /*
-    
     let dmac = unsafe { (*eth_hdr).dst_addr };
     let interface = unsafe { MACTABLE.get(&dmac).ok_or(xdp_action::XDP_ABORTED)? };
     let res = unsafe { bpf_redirect(*interface, 0)};
     Ok(res as u32)
-
     */
-    
-    
-    
-    
 }
 
 #[panic_handler]
@@ -265,4 +297,21 @@ pub fn ptr_at_md<T>(ctx: &XdpContext, offset: usize) -> Option<*const T> {
     }
     info!(ctx, "returning metadata");
     Some((start + offset) as *const T)
+}
+
+#[inline(always)]
+fn _csum(data_start: *mut u32, data_size: u32, csum: u32) -> u16 {
+    let cs = unsafe { bpf_csum_diff(0 as *mut u32, 0, data_start, data_size, csum) };
+    _csum_fold_helper(cs)
+}
+
+#[inline(always)]
+fn _csum_fold_helper(csum: i64) -> u16 {
+    let mut sum = csum;
+    for _ in 0..4 {
+        if sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+    }
+    !sum as u16
 }

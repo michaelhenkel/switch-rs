@@ -26,6 +26,8 @@ rtnetlink = "0.14.1"
 netlink-packet-route = "0.19.0"
 ipnet = "2.9.0"
 async-trait = "0.1.77"
+pnet_macros = "0.34.0"
+pnet_macros_support = "0.34.0"
 
 [[bin]]
 name = "switch-rs"

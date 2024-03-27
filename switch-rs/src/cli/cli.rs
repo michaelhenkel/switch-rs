@@ -46,12 +46,16 @@ enum ShowCommands {
     Flows,
     MaxPackets,
     FlowTimeout,
+    FlowletSize,
 }
 
 #[derive(Clone, Parser, Debug)]
 enum SetCommands {
     MaxPackets{max_packets: u64},
     FlowTimeout{flow_timeout: u64},
+    FlowletSize{flowlet_size: u32},
+    PauseOff,
+    PauseOn,
 }
 
 
@@ -97,6 +101,10 @@ async fn cli(client: FlowManagerClient) -> anyhow::Result<()> {
                         ShowCommands::FlowTimeout => {
                             let flow_timeout = client.show_flow_timeout().await.unwrap();
                             println!("flow_timeout: {}", flow_timeout);
+                        },
+                        ShowCommands::FlowletSize => {
+                            let flowlet_size = client.show_flowlet_size().await.unwrap();
+                            println!("flowlet_size: {}", flowlet_size);
                         }
                     }
                 },
@@ -112,6 +120,21 @@ async fn cli(client: FlowManagerClient) -> anyhow::Result<()> {
                             client.set_flow_timeout(flow_timeout).await.unwrap();
                             println!("flow_timeout set to {}", client.show_flow_timeout().await.unwrap());
                         },
+                        SetCommands::PauseOff => {
+                            println!("Turning pause off");
+                            client.toggle_pause(false).await.unwrap();
+                            println!("pause is {}", client.show_pause().await.unwrap());
+                        },
+                        SetCommands::PauseOn => {
+                            println!("Turning pause on");
+                            client.toggle_pause(true).await.unwrap();
+                            println!("pause is {}", client.show_pause().await.unwrap());
+                        },
+                        SetCommands::FlowletSize{flowlet_size} => {
+                            println!("Setting flowlet_size to {}", flowlet_size);
+                            client.set_flowlet_size(flowlet_size).await.unwrap();
+                            println!("flowlet_size set to {}", client.show_flowlet_size().await.unwrap());
+                        }
                     }
                 },
                 Commands::Exit => {
@@ -128,8 +151,12 @@ fn root_suggester(val: &str) -> Result<Vec<String>, CustomUserError> {
     let suggestions = [
         "set max-packets",
         "set flow-timeout",
+        "set flow-size",
+        "set pause-off",
+        "set pause-on",
         "show flows",
         "show stats",
+        "show flowlet-size",
         "show max-packets",
         "show flow-timeout",
         "exit",

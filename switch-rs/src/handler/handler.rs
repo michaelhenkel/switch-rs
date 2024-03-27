@@ -200,6 +200,7 @@ impl Handler {
                     packet_count: 0,
                     active_next_hop: 0,
                     max_packets: 0,
+                    ecn: 0,
                 };
 
                 let flow = Flow{
@@ -239,6 +240,7 @@ impl Handler {
                             packet_count: 0,
                             active_next_hop: 0,
                             max_packets: 0,
+                            ecn: 0,
                         };
 
                         let flow = Flow{
@@ -301,6 +303,7 @@ impl Handler {
                         packet_count: 0,
                         active_next_hop: 0,
                         max_packets: 10,
+                        ecn: 0,
                     };
                     flow.as_mut().unwrap().next_hops.push(flow_next_hop);
                     ret = Some(vec![(*oif_idx, queue_id)]);
@@ -354,6 +357,7 @@ impl Handler {
                                         packet_count: 0,
                                         active_next_hop: 0,
                                         max_packets: 0,
+                                        ecn: 0,
                                     };
 
                                     let flow = Flow{

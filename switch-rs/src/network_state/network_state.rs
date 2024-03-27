@@ -4,14 +4,16 @@ use aya::maps::{HashMap as BpfHashMap, MapData};
 use futures::TryStreamExt;
 use log::info;
 use netlink_packet_route::{address, link::{InfoBridgePort, InfoPortData, InfoPortKind, LinkAttribute, LinkInfo}, route::{RouteAddress, RouteAttribute}, AddressFamily};
-use pnet::{datalink::{self, Channel, Config, NetworkInterface}, packet::{arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket}, ethernet::{EtherTypes, MutableEthernetPacket}, Packet}, util::MacAddr};
+use pnet::{datalink::{self, Channel, Config, NetworkInterface}, packet::{arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket}, ethernet::{EtherType, EtherTypes, MutableEthernetPacket}, Packet}, util::MacAddr};
 use rtnetlink::{new_connection, IpVersion};
 use switch_rs_common::InterfaceConfiguration;
 use tokio::sync::RwLock;
 use pnet::packet::MutablePacket;
-
+use pnet_macros::Packet;
+use pnet_macros_support::types::*;
 use crate::af_xdp::interface::interface::Interface;
 
+const FLOWLET_SIZE: u32 = 10;
 
 #[derive(Debug, Default, Clone)]
 struct State{
@@ -84,13 +86,13 @@ impl Display for NetlinkInterface{
 pub struct NetworkState{
     rx: Arc<RwLock<tokio::sync::mpsc::Receiver<NetworkStateCommand>>>,
     client: NetworkStateClient,
-    global_interface_configuration: Arc<Mutex<BpfHashMap<MapData, u32, InterfaceConfiguration>>>,
+    global_interface_configuration: Arc<RwLock<BpfHashMap<MapData, u32, InterfaceConfiguration>>>,
     interface_list: HashMap<u32, Interface>,
     state: State,
 }
 
 impl NetworkState{
-    pub fn new(interface_list: HashMap<u32, Interface>, global_interface_configuration: Arc<Mutex<BpfHashMap<MapData, u32, InterfaceConfiguration>>>) -> Self{
+    pub fn new(interface_list: HashMap<u32, Interface>, global_interface_configuration: Arc<RwLock<BpfHashMap<MapData, u32, InterfaceConfiguration>>>) -> Self{
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let client = NetworkStateClient::new(tx);
         Self{
@@ -123,6 +125,8 @@ impl NetworkState{
                 self.state.ifidx_to_vrf.insert(*ifidx, vrf);
                 interface_configuration.vrf = vrf;
             }
+            interface_configuration.mac = mac;
+            interface_configuration.flowlet_size = FLOWLET_SIZE;
             
             let bridge_id = get_bridge_id_from_ifidx(*ifidx).await;
             if let Some(bridge_id) = bridge_id{
@@ -154,7 +158,7 @@ impl NetworkState{
             self.state.interfaces.insert(*ifidx, interface);
             self.state.ifidx_to_mac.insert(*ifidx, mac);
             self.state.mac_to_ifidx.insert(mac, *ifidx);
-            self.global_interface_configuration.lock().unwrap().insert(*ifidx, interface_configuration, 0).unwrap();
+            self.global_interface_configuration.write().await.insert(*ifidx, interface_configuration, 0).unwrap();
 
         }
 
@@ -212,6 +216,9 @@ impl NetworkState{
                     let mac = self.send_arp_request(prefix, src_mac, src_ip, dst_ifidx).await;
                     tx.send(mac).unwrap();
                 },
+                NetworkStateCommand::SendPauseFrame { src_mac, dst_ifidx } => {
+                    self.send_ethernet_pause_frame(src_mac, dst_ifidx).await;
+                }
 
             }
         }
@@ -384,14 +391,12 @@ impl NetworkState{
 
         tx.send_to(&ethernet_packet.to_immutable().packet(), Some(network_interface.clone()));
         loop {
-            info!("Waiting for arp response");
             let buf = match rx.next(){
                 Ok(buf) => buf,
                 Err(_e) => {
                     return None;
                 }
             };
-            info!("Got arp response");
             let arp = ArpPacket::new(&buf[MutableEthernetPacket::minimum_packet_size()..]).unwrap();
             if arp.get_sender_proto_addr() == Ipv4Addr::from(prefix)
                 && arp.get_target_hw_addr() == Into::<MacAddr>::into(src_mac)
@@ -399,6 +404,34 @@ impl NetworkState{
                 return Some(arp.get_sender_hw_addr().into());
             }
         }
+    }
+    pub async fn send_ethernet_pause_frame(&self, src_mac: [u8;6], dst_ifidx: u32) {
+        let interfaces = datalink::interfaces();
+        let interfaces_name_match = |iface: &NetworkInterface| iface.index == dst_ifidx;
+        let network_interface = interfaces.into_iter().filter(interfaces_name_match).next().unwrap();
+    
+        let mut ethernet_buffer = [0u8; 42];
+        let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+        //01-80-C2-00-00-01
+
+        let multicast_mac = [0x01, 0x80, 0xC2, 0x00, 0x00, 0x01];
+        ethernet_packet.set_destination(MacAddr::from(multicast_mac));
+        ethernet_packet.set_source(src_mac.into());
+        ethernet_packet.set_ethertype(EtherType::new(34824));
+        
+        let mut pause_buffer = [0u8; 4];
+        let mut pause_packet = MutablePauseFrameHeaderPacket::new(&mut pause_buffer).unwrap();
+        pause_packet.set_pause(0x01);
+        pause_packet.set_quanta(0xFFFF);
+        ethernet_packet.set_payload(pause_packet.packet_mut());
+        let configuration = Config::default();
+        let (mut tx,  _rx) = match datalink::channel(&network_interface, configuration) {
+            Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
+            Ok(_) => panic!("Unknown channel type"),
+            Err(e) => panic!("Error happened {}", e),
+        };
+        tx.send_to(&ethernet_packet.to_immutable().packet(), Some(network_interface.clone()));
+
     }
 }
 
@@ -476,6 +509,10 @@ impl NetworkStateClient{
         local_tx.send(NetworkStateCommand::SendArpRequest{prefix, src_mac, src_ip, dst_ifidx, tx}).await.unwrap();
         rx.await.unwrap()
     }
+    pub async fn send_pause_frame(&self, src_mac: [u8;6], dst_ifidx: u32){
+        let local_tx = self.tx.clone();
+        local_tx.send(NetworkStateCommand::SendPauseFrame{src_mac, dst_ifidx}).await.unwrap();
+    }
 }
 
 pub enum NetworkStateCommand{
@@ -518,6 +555,10 @@ pub enum NetworkStateCommand{
         src_ip: u32,
         dst_ifidx: u32,
         tx: tokio::sync::oneshot::Sender<Option<[u8;6]>>,
+    },
+    SendPauseFrame{
+        src_mac: [u8;6],
+        dst_ifidx: u32,
     },
 }
 
@@ -629,11 +670,10 @@ async fn get_ip_addresses_from_ifidx(idx: u32) -> Vec<(u32, u8)>{
     ips
 }
 
-
-
-/*
-route_msg: RouteMessage { header: RouteHeader { address_family: Inet, destination_prefix_length: 24, source_prefix_length: 0, tos: 0, table: 100, protocol: Boot, scope: Universe, kind: Unicast, flags: [] }, attributes: [Table(100), Destination(Inet(192.168.1.0)), MultiPath([RouteNextHop { flags: [], hops: 0, interface_index: 60, attributes: [Gateway(Inet(1.1.1.2))] }, RouteNextHop { flags: [], hops: 0, interface_index: 62, attributes: [Gateway(Inet(2.2.2.2))] }])] }
-route_msg: RouteMessage { header: RouteHeader { address_family: Inet, destination_prefix_length: 24, source_prefix_length: 0, tos: 0, table: 100, protocol: Boot, scope: Universe, kind: Unicast, flags: [] }, attributes: [Table(100), Destination(Inet(192.168.1.0)), MultiPath([RouteNextHop { flags: [], hops: 0, interface_index: 60, attributes: [Gateway(Inet(1.1.1.2))] }, RouteNextHop { flags: [], hops: 0, interface_index: 62, attributes: [Gateway(Inet(2.2.2.2))] }])] }
-route_msg: RouteMessage { header: RouteHeader { address_family: Inet, destination_prefix_length: 24, source_prefix_length: 0, tos: 0, table: 100, protocol: Boot, scope: Universe, kind: Unicast, flags: [] }, attributes: [Table(100), Destination(Inet(192.168.5.0)), Gateway(Inet(1.1.1.2)), Oif(60)] }
-
-*/
+#[derive(Packet)]
+pub struct PauseFrameHeader{
+    pub pause: u16be,
+    pub quanta: u16be,
+    #[payload]
+    pub payload: Vec<u8>,
+}

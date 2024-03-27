@@ -14,6 +14,7 @@ use af_xdp::{
     interface::interface::{get_interface_index, get_interface_mac},
     af_xdp::AfXdp,
 };
+use tokio::sync::RwLock;
 use crate::af_xdp::interface::interface::Interface;
 use crate::cli::cli::Cli;
 use crate::network_state::network_state::NetworkState;
@@ -151,18 +152,26 @@ async fn main() -> Result<(), anyhow::Error> {
         panic!("INTERFACESTATS map not found");
     };
 
+    let ecn_marker_table = if let Some(ecn_marker_table) = bpf.take_map("ECNMARKERTABLE"){
+        let ecn_marker_table: BpfHashMap<MapData, FlowKey, u8> = BpfHashMap::try_from(ecn_marker_table).unwrap();
+        ecn_marker_table
+    } else {
+        panic!("ECNMARKERTABLE map not found");
+    };
+
     for (ifidx, _) in &interface_list{
-        if let Err(e) = interface_stats.insert(ifidx, InterfaceStats{rx_packets: 0, tx_packets: 0, flows: 0, rate: 0}, 0){
+        if let Err(e) = interface_stats.insert(ifidx, InterfaceStats{rx_packets: 0, tx_packets: 0, flows: 0, rate: 0, ecn_marked: 0, flowlet_packets: 0, pause_sent: 0}, 0){
             panic!("Failed to insert interface stats into map: {}", e);
         }
     }
 
     let mac_table_mutex = Arc::new(Mutex::new(mac_table));
     let arp_table_mutex = Arc::new(Mutex::new(arp_table));
-    let interface_configuration_mutex = Arc::new(Mutex::new(interface_configuration));
+    let interface_configuration_mutex = Arc::new(RwLock::new(interface_configuration));
 
-    let mut flow_manager = FlowManager::new();
+    
     let mut network_state = NetworkState::new(interface_list.clone(), interface_configuration_mutex.clone());
+    let mut flow_manager = FlowManager::new(network_state.client());
     let handler = handler::handler::Handler::new(interface_list.clone(), mac_table_mutex, arp_table_mutex, network_state.client(), flow_manager.client());
     let afxdp = AfXdp::new(interface_list.clone(), xsk_map, interface_queue_table);
     let cli = Cli::new(flow_manager.client());
@@ -170,7 +179,12 @@ async fn main() -> Result<(), anyhow::Error> {
     let handler_clone = handler.clone();
 
     let jh = tokio::spawn(async move {
-        flow_manager.run(flow_table, interface_stats, interface_configuration_mutex).await;
+        flow_manager.run(
+            flow_table,
+            interface_stats,
+            interface_configuration_mutex,
+            ecn_marker_table,
+        ).await;
     });
     jh_list.push(jh);
     let jh = tokio::spawn(async move {
