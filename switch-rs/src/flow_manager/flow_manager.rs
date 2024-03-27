@@ -4,7 +4,7 @@ use switch_rs_common::{FlowKey, FlowNextHop, InterfaceConfiguration, InterfaceSt
 use tokio::{sync::{mpsc::Receiver, RwLock}, time::Instant};
 use crate::network_state::network_state::NetworkStateClient;
 
-const FLOWLET_SIZE: u32 = 10;
+const FLOWLET_SIZE: u32 = 1000;
 
 pub struct FlowManager{
     rx: Arc<RwLock<Receiver<FlowCommand>>>,
@@ -24,7 +24,8 @@ impl FlowManager{
     }
     pub async fn run(
         &mut self,
-        mut global_flow_table: BpfHashMap<MapData, FlowKey, FlowNextHop>,
+        mut global_flow_table: BpfHashMap<MapData, FlowKey, [FlowNextHop; 32]>,
+        mut global_active_flow_table: BpfHashMap<MapData, FlowKey, FlowNextHop>,
         mut interface_stats: BpfHashMap<MapData, u32, InterfaceStats>,
         interface_config: Arc<RwLock<BpfHashMap<MapData, u32, InterfaceConfiguration>>>,
         mut ecn_marker_table: BpfHashMap<MapData, FlowKey, u8>,
@@ -60,13 +61,18 @@ impl FlowManager{
 
                                     flow_next_hops = nh_ranked_list.into_iter().map(|(_, v)| v).collect();
 
-                                    for nh in &mut flow_next_hops{
-                                        nh.active_next_hop = 0;
-                                    }
                                     let now = tokio::time::Instant::now();
                                     local_flow_table.insert(flow_key, LocalNextHop{next_hop_list: flow_next_hops.clone(), last_updated: now, packet_count: 0});
 
-                                    if let Err(e) = global_flow_table.insert(flow_key, flow_next_hops[0],0){
+                                    if let Err(e) = global_active_flow_table.insert(flow_key, flow_next_hops[0],0){
+                                        log::error!("Failed to insert flow into global flow table: {}", e);
+                                    }
+                                    if flow_next_hops.len() != 32 {
+                                        flow_next_hops.resize(32, FlowNextHop::default());
+                                    }
+                                    let flow_next_hops_slice: [FlowNextHop; 32] = flow_next_hops.as_slice().try_into().unwrap();
+
+                                    if let Err(e) = global_flow_table.insert(flow_key, flow_next_hops_slice,0){
                                         log::error!("Failed to insert flow into global flow table: {}", e);
                                     }
 
@@ -76,7 +82,7 @@ impl FlowManager{
                                     }
                                 },
                                 FlowCommand::GetIfidxQueue { flow_key, tx } => {
-                                    let active_flow = global_flow_table.get(&flow_key, 0).ok();
+                                    let active_flow = global_active_flow_table.get(&flow_key, 0).ok();
                                     let res = if let Some(active_flow) = active_flow{
                                         Some((active_flow.oif_idx, active_flow.queue_id))
                                     } else {
@@ -102,7 +108,7 @@ impl FlowManager{
                                 },
                                 FlowCommand::ListFlows { tx } => {
                                     let mut flow_map = HashMap::new();
-                                    for res in global_flow_table.iter(){
+                                    for res in global_active_flow_table.iter(){
                                         if let Ok((flow_key, flow_next_hop)) = res{
                                             if let Some(local_next_hop) = local_flow_table.get(&flow_key){
                                                 flow_map.insert(flow_key.clone(), (flow_next_hop.clone(), local_next_hop.last_updated));
@@ -118,9 +124,9 @@ impl FlowManager{
                                     }
                                 },
                                 FlowCommand::IncrFlowPacketCount { flow_key } => {
-                                    if let Ok(mut flow) = global_flow_table.get(&flow_key, 0){
+                                    if let Ok(mut flow) = global_active_flow_table.get(&flow_key, 0){
                                         flow.packet_count += 1;
-                                        let _ = global_flow_table.insert(flow_key, flow, 0);
+                                        let _ = global_active_flow_table.insert(flow_key, flow, 0);
                                     }
                                 },
                                 FlowCommand::SetMaxPackets { max_packets: mp } => {
@@ -163,8 +169,8 @@ impl FlowManager{
                     _ = monitor_interval.tick() => {
                         let mut inactive_flows = Vec::new();
                         for (flow_key, local_next_hop) in &mut local_flow_table{
-                            let flow_list = &local_next_hop.next_hop_list;
-                            if let Ok(active_flow) = global_flow_table.get(flow_key, 0){
+                            //let flow_list = &local_next_hop.next_hop_list;
+                            if let Ok(active_flow) = global_active_flow_table.get(flow_key, 0){
                                 let now = tokio::time::Instant::now();
                                 if now.duration_since(local_next_hop.last_updated).as_secs() >= flow_timeout && active_flow.packet_count == local_next_hop.packet_count{
                                     inactive_flows.push((flow_key.clone(), active_flow.oif_idx));
@@ -183,9 +189,8 @@ impl FlowManager{
                                     }
                                 }
                                 local_next_hop.packet_count = active_flow.packet_count;
+                                /*
                                 if flow_list.len() > 1{
-
-
                                     if active_flow.packet_count > flowlet_size as u64 && flowlet_size > 0{
                                         let active_next_hop = active_flow.active_next_hop;
                                         let next_active_next_hop_index = (active_next_hop + 1) % flow_list.len() as u32;
@@ -205,11 +210,13 @@ impl FlowManager{
                                         }
                                     }
                                 }
+                                */
                             }
                         }
                         for (flow_key, ifidx) in inactive_flows{
                             local_flow_table.remove(&flow_key);
-                            let _ = global_flow_table.remove(&flow_key);
+                            global_flow_table.remove(&flow_key).unwrap();
+                            global_active_flow_table.remove(&flow_key).unwrap();
                             if let Ok(mut stats) = interface_stats.get(&ifidx, 0){
                                 if stats.flows > 0{
                                     stats.flows -= 1;
@@ -217,28 +224,6 @@ impl FlowManager{
                                 }
                             }
                         }
-                        if pause_on{
-                            let mut reset_stats = HashMap::new();
-                            for res in interface_stats.iter(){
-                                if let Ok((interface, mut stats)) = res{
-                                    if let Ok(interface_configuration) = interface_config.read().await.get(&interface, 0){
-                                        if interface_configuration.l2 == 1{
-                                            if stats.flowlet_packets > 0 && stats.flowlet_packets >= max_packets as u32{
-                                                network_state_client.send_pause_frame(interface_configuration.mac, interface).await;
-                                                stats.flowlet_packets = 0;
-                                                stats.pause_sent += 1;
-                                                reset_stats.insert(interface, stats);
-                                                
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            for (intf, stats) in reset_stats{
-                                interface_stats.insert(&intf, stats, 0).unwrap();
-                            }
-                        }
-
                     },
                 }
             }

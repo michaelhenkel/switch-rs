@@ -10,6 +10,10 @@ use netlink_packet_route::link::{InfoBridgePort, InfoPortData, LinkAttribute, Li
 use pnet::packet::MutablePacket;
 use futures::TryStreamExt;
 use crate::flow_manager::flow_manager::FlowManagerClient;
+
+
+const FLOWLET_SIZE: u32 = 1000;
+
 #[derive(Clone)]
 pub struct Handler{
     interface_list: HashMap<u32, Interface>,
@@ -198,8 +202,7 @@ impl Handler {
                     next_hop_count: 0,
                     next_hop_idx: 0,
                     packet_count: 0,
-                    active_next_hop: 0,
-                    max_packets: 0,
+                    flowlet_size: 0,
                     ecn: 0,
                 };
 
@@ -238,8 +241,7 @@ impl Handler {
                             next_hop_count: 0,
                             next_hop_idx: 0,
                             packet_count: 0,
-                            active_next_hop: 0,
-                            max_packets: 0,
+                            flowlet_size: 0,
                             ecn: 0,
                         };
 
@@ -301,8 +303,7 @@ impl Handler {
                         next_hop_count,
                         next_hop_idx: idx as u32,
                         packet_count: 0,
-                        active_next_hop: 0,
-                        max_packets: 10,
+                        flowlet_size: FLOWLET_SIZE,
                         ecn: 0,
                     };
                     flow.as_mut().unwrap().next_hops.push(flow_next_hop);
@@ -355,8 +356,7 @@ impl Handler {
                                         next_hop_count,
                                         next_hop_idx: 0,
                                         packet_count: 0,
-                                        active_next_hop: 0,
-                                        max_packets: 0,
+                                        flowlet_size: 0,
                                         ecn: 0,
                                     };
 

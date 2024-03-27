@@ -60,7 +60,11 @@ static mut INTERFACESTATS: HashMap<u32, InterfaceStats> =
     HashMap::<u32, InterfaceStats>::with_max_entries(256, 0);
 
 #[map(name = "FLOWTABLE")]
-static mut FLOWTABLE: HashMap<FlowKey, FlowNextHop> =
+static mut FLOWTABLE: HashMap<FlowKey, [FlowNextHop; 32]> =
+    HashMap::<FlowKey, [FlowNextHop; 32]>::with_max_entries(65535, 0);
+
+#[map(name = "ACTIVEFLOWTABLE")]
+static mut ACTIVEFLOWTABLE: HashMap<FlowKey, FlowNextHop> =
     HashMap::<FlowKey, FlowNextHop>::with_max_entries(65535, 0);
 
 #[map(name = "ECNMARKERTABLE")]
@@ -169,19 +173,19 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                 src_port: u16::from_be(source),
                 dst_port: u16::from_be(dest),
             };
-            if let Some(flow_next_hop) = unsafe { FLOWTABLE.get_ptr_mut(&flow_key) }{  
+            if let Some(active_flow_next_hop) = unsafe { ACTIVEFLOWTABLE.get_ptr_mut(&flow_key) }{  
                 for i in 0..6{
-                    unsafe { (*eth_hdr).src_addr[i] = (*flow_next_hop).src_mac[i] };
-                    unsafe { (*eth_hdr).dst_addr[i] = (*flow_next_hop).dst_mac[i] };
+                    unsafe { (*eth_hdr).src_addr[i] = (*active_flow_next_hop).src_mac[i] };
+                    unsafe { (*eth_hdr).dst_addr[i] = (*active_flow_next_hop).dst_mac[i] };
                 }
-                unsafe { (*flow_next_hop).packet_count += 1 };
-                let ifidx = unsafe { (*flow_next_hop).oif_idx };
+                unsafe { (*active_flow_next_hop).packet_count += 1 };
+                let ifidx = unsafe { (*active_flow_next_hop).oif_idx };
                 unsafe { INTERFACESTATS.get_ptr_mut(&ifidx) }.map(|interface_stats|{
                     unsafe { (*interface_stats).tx_packets += 1 };
                 });
                 
-                let send_ecn = if unsafe{ (*flow_next_hop).ecn == 1}{
-                    unsafe{ (*flow_next_hop).ecn = 0 };
+                let send_ecn = if unsafe{ (*active_flow_next_hop).ecn == 1}{
+                    unsafe{ (*active_flow_next_hop).ecn = 0 };
                     true
                 } else {
                     false
@@ -199,26 +203,14 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                     if let Some(flowlet_packets) = flowlet_packets{
                         let flowlet_size = interface_configuration.flowlet_size;
                         if flowlet_packets > 0 && flowlet_packets >= flowlet_size{
-                            let rev_flow_key = FlowKey{
-                                src_ip: flow_key.dst_ip,
-                                dst_ip: flow_key.src_ip,
-                                src_port: flow_key.dst_port,
-                                dst_port: flow_key.src_port,
-                            };
-                            let rev_flow_next_hop = match unsafe { FLOWTABLE.get_ptr_mut(&rev_flow_key) }{
-                                Some(rev_flow_next_hop) => rev_flow_next_hop,
-                                None => {
-                                    info!(&ctx,"failed to get reverse flow from FLOWTABLE");
-                                    return Ok(xdp_action::XDP_ABORTED);
-                                }
-                            };
-                            unsafe { (*rev_flow_next_hop).ecn = 1 };
+                            unsafe { (*active_flow_next_hop).ecn = 1 };
                             unsafe { INTERFACESTATS.get_ptr_mut(&ingress_if_idx) }.map(|interface_stats|{
                                 unsafe { (*interface_stats).flowlet_packets = 0; };
                             });
                         }
                     }
                 }
+                 
                 if send_ecn{
                     unsafe { (*ipv4_hdr).check = 0};
                     unsafe { (*ipv4_hdr).tos = 0x03 };
@@ -228,6 +220,39 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                         unsafe { (*interface_stats).ecn_marked += 1 };
                     });
                 }
+                
+                
+                if unsafe { (*active_flow_next_hop).next_hop_count > 1 &&  (*active_flow_next_hop).flowlet_size > 0 && (*active_flow_next_hop).packet_count as u32 >= (*active_flow_next_hop).flowlet_size}{
+                    let current_nh_index = unsafe { (*active_flow_next_hop).next_hop_idx };
+                    let next_hop_count = unsafe { (*active_flow_next_hop).next_hop_count };
+                    let next_next_hop_index = if current_nh_index + 1 < next_hop_count{
+                        current_nh_index + 1
+                    } else {
+                        0
+                    };
+                    if let Some(next_hop_list) = unsafe { FLOWTABLE.get_ptr(&flow_key) }{
+                        let next_hop_list = unsafe { &(*next_hop_list) };
+                        let next_hop_list_len = next_hop_list.len();
+                        if (next_next_hop_index as usize) < next_hop_list_len{
+                            let next_next_hop = next_hop_list[next_next_hop_index as usize];
+                            
+                            unsafe { 
+                                (*active_flow_next_hop).oif_idx = next_next_hop.oif_idx;
+                                (*active_flow_next_hop).queue_id = next_next_hop.queue_id;
+                                (*active_flow_next_hop).src_mac = next_next_hop.src_mac;
+                                (*active_flow_next_hop).dst_mac = next_next_hop.dst_mac;
+                                (*active_flow_next_hop).next_hop_idx = next_next_hop_index;
+                                (*active_flow_next_hop).packet_count = 0;
+                                (*active_flow_next_hop).flowlet_size = next_next_hop.flowlet_size;
+                                (*active_flow_next_hop).ecn = next_next_hop.ecn;
+                            };
+                            
+                        }                        
+                    };
+                }
+                
+                
+                
                 let res = unsafe { bpf_redirect(ifidx, 0)};
                 return Ok(res as u32)
             }

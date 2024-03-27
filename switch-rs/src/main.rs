@@ -125,10 +125,17 @@ async fn main() -> Result<(), anyhow::Error> {
     };
 
     let flow_table = if let Some(flow_table) = bpf.take_map("FLOWTABLE"){
-        let flow_table: BpfHashMap<MapData, FlowKey, FlowNextHop> = BpfHashMap::try_from(flow_table).unwrap();
+        let flow_table: BpfHashMap<MapData, FlowKey, [FlowNextHop; 32]> = BpfHashMap::try_from(flow_table).unwrap();
         flow_table
     } else {
         panic!("FLOWTABLE map not found");
+    };
+
+    let active_flow_table = if let Some(active_flow_table) = bpf.take_map("ACTIVEFLOWTABLE"){
+        let active_flow_table: BpfHashMap<MapData, FlowKey, FlowNextHop> = BpfHashMap::try_from(active_flow_table).unwrap();
+        active_flow_table
+    } else {
+        panic!("ACTIVEFLOWTABLE map not found");
     };
 
     let arp_table = if let Some(arp_table) = bpf.take_map("ARPTABLE"){
@@ -181,6 +188,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let jh = tokio::spawn(async move {
         flow_manager.run(
             flow_table,
+            active_flow_table,
             interface_stats,
             interface_configuration_mutex,
             ecn_marker_table,
