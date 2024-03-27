@@ -4,7 +4,7 @@ use switch_rs_common::{FlowKey, FlowNextHop, InterfaceConfiguration, InterfaceSt
 use tokio::{sync::{mpsc::Receiver, RwLock}, time::Instant};
 use crate::network_state::network_state::NetworkStateClient;
 
-const FLOWLET_SIZE: u32 = 10;
+const FLOWLET_SIZE: u32 = 1000;
 
 pub struct FlowManager{
     rx: Arc<RwLock<Receiver<FlowCommand>>>,

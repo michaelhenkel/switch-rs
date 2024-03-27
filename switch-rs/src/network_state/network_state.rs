@@ -13,7 +13,7 @@ use pnet_macros::Packet;
 use pnet_macros_support::types::*;
 use crate::af_xdp::interface::interface::Interface;
 
-const FLOWLET_SIZE: u32 = 10;
+const FLOWLET_SIZE: u32 = 1000;
 
 #[derive(Debug, Default, Clone)]
 struct State{

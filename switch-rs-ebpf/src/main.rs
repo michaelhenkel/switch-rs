@@ -199,21 +199,12 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                     if let Some(flowlet_packets) = flowlet_packets{
                         let flowlet_size = interface_configuration.flowlet_size;
                         if flowlet_packets > 0 && flowlet_packets >= flowlet_size{
-                            let rev_flow_key = FlowKey{
-                                src_ip: flow_key.dst_ip,
-                                dst_ip: flow_key.src_ip,
-                                src_port: flow_key.dst_port,
-                                dst_port: flow_key.src_port,
-                            };
-                            let rev_flow_next_hop = match unsafe { FLOWTABLE.get_ptr_mut(&rev_flow_key) }{
-                                Some(rev_flow_next_hop) => rev_flow_next_hop,
-                                None => {
-                                    info!(&ctx,"failed to get reverse flow from FLOWTABLE");
-                                    return Ok(xdp_action::XDP_ABORTED);
-                                }
-                            };
-                            unsafe { (*rev_flow_next_hop).ecn = 1 };
+                            unsafe { (*ipv4_hdr).check = 0};
+                            unsafe { (*ipv4_hdr).tos = 0x03 };
+                            let csum = _csum(ipv4_hdr as *mut u32, Ipv4Hdr::LEN as u32, 0);
+                            unsafe { (*ipv4_hdr).check = csum };
                             unsafe { INTERFACESTATS.get_ptr_mut(&ingress_if_idx) }.map(|interface_stats|{
+                                unsafe { (*interface_stats).ecn_marked += 1 };
                                 unsafe { (*interface_stats).flowlet_packets = 0; };
                             });
                         }
