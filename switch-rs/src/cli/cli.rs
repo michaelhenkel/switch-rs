@@ -191,6 +191,7 @@ fn display_flow_next_hop(flow_next_hop: &FlowNextHop, last_updated: &tokio::time
     let oif = flow_next_hop.oif_idx;
     let packets = flow_next_hop.packet_count;
     let last_updated = last_updated.elapsed().as_secs();
-    format!("src_mac {} dst_mac {} oif {} packets {}, last_updated {}s ago",
-        src_mac, dst_mac, oif, packets, last_updated)
+    let flowlet_size = flow_next_hop.flowlet_size;
+    format!("src_mac {} dst_mac {} oif {} packets {}, flowlet_size: {}, last_updated {}s ago",
+        src_mac, dst_mac, oif, packets, flowlet_size, last_updated)
 }

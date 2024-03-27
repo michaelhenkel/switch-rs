@@ -184,45 +184,19 @@ fn try_switch_rs(ctx: XdpContext) -> Result<u32, u32> {
                     unsafe { (*interface_stats).tx_packets += 1 };
                 });
                 
-                let send_ecn = if unsafe{ (*active_flow_next_hop).ecn == 1}{
-                    unsafe{ (*active_flow_next_hop).ecn = 0 };
-                    true
-                } else {
-                    false
-                };
-            
-                let interface_configuration = match unsafe { INTERFACECONFIGURATION.get(&ingress_if_idx) }{
-                    Some(interface_configuration) => interface_configuration,
-                    None => {
-                        info!(&ctx,"failed to get interface configuration from INTERFACECONFIGURATION");
-                        return Ok(xdp_action::XDP_ABORTED);
-                    }
-                };
-
-                if interface_configuration.l2 == 1 {
-                    if let Some(flowlet_packets) = flowlet_packets{
-                        let flowlet_size = interface_configuration.flowlet_size;
-                        if flowlet_packets > 0 && flowlet_packets >= flowlet_size{
-                            unsafe { (*active_flow_next_hop).ecn = 1 };
+                if unsafe { (*active_flow_next_hop).next_hop_count > 1 &&  (*active_flow_next_hop).flowlet_size > 0 && (*active_flow_next_hop).packet_count as u32 >= (*active_flow_next_hop).flowlet_size}{
+                    if let Some(interface_configuration) = unsafe { INTERFACECONFIGURATION.get(&ingress_if_idx) }{
+                        if interface_configuration.l2 == 1 {
+                            unsafe { (*ipv4_hdr).check = 0};
+                            unsafe { (*ipv4_hdr).tos = 0x03 };
+                            let csum = _csum(ipv4_hdr as *mut u32, Ipv4Hdr::LEN as u32, 0);
+                            unsafe { (*ipv4_hdr).check = csum };
                             unsafe { INTERFACESTATS.get_ptr_mut(&ingress_if_idx) }.map(|interface_stats|{
-                                unsafe { (*interface_stats).flowlet_packets = 0; };
+                                unsafe { (*interface_stats).ecn_marked += 1 };
                             });
                         }
                     }
-                }
-                 
-                if send_ecn{
-                    unsafe { (*ipv4_hdr).check = 0};
-                    unsafe { (*ipv4_hdr).tos = 0x03 };
-                    let csum = _csum(ipv4_hdr as *mut u32, Ipv4Hdr::LEN as u32, 0);
-                    unsafe { (*ipv4_hdr).check = csum };
-                    unsafe { INTERFACESTATS.get_ptr_mut(&ingress_if_idx) }.map(|interface_stats|{
-                        unsafe { (*interface_stats).ecn_marked += 1 };
-                    });
-                }
-                
-                
-                if unsafe { (*active_flow_next_hop).next_hop_count > 1 &&  (*active_flow_next_hop).flowlet_size > 0 && (*active_flow_next_hop).packet_count as u32 >= (*active_flow_next_hop).flowlet_size}{
+                    
                     let current_nh_index = unsafe { (*active_flow_next_hop).next_hop_idx };
                     let next_hop_count = unsafe { (*active_flow_next_hop).next_hop_count };
                     let next_next_hop_index = if current_nh_index + 1 < next_hop_count{

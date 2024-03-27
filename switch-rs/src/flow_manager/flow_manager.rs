@@ -224,6 +224,28 @@ impl FlowManager{
                                 }
                             }
                         }
+
+                        if pause_on{
+                            let mut reset_stats = HashMap::new();
+                            for res in interface_stats.iter(){
+                                if let Ok((interface, mut stats)) = res{
+                                    if let Ok(interface_configuration) = interface_config.read().await.get(&interface, 0){
+                                        if interface_configuration.l2 == 1{
+                                            if stats.flowlet_packets > 0 && stats.flowlet_packets >= max_packets as u32{
+                                                network_state_client.send_pause_frame(interface_configuration.mac, interface).await;
+                                                stats.flowlet_packets = 0;
+                                                stats.pause_sent += 1;
+                                                reset_stats.insert(interface, stats);
+                                                
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            for (intf, stats) in reset_stats{
+                                interface_stats.insert(&intf, stats, 0).unwrap();
+                            }
+                        }
                     },
                 }
             }
